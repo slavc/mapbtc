@@ -175,7 +175,7 @@ bool print_peer(void *arg, struct peer *peer)
 		f = stdout;
 	}
 	fprintf(f, "%s,%u,%u,%lu,\"%s\",%u\n",
-	    str_peer(peer), (unsigned)peer->is_dead,
+	    str_peer(peer), (unsigned)!peer->is_dead,
 	    peer->version.protocol, peer->version.services,
 	    peer->version.user_agent, peer->version.start_height);
 	return true;
@@ -717,7 +717,7 @@ int main(int argc, char **argv)
 	if (peers_csv == NULL) {
 		err(1, "failed to open peers csv file");
 	}
-	fprintf(peers_csv, "IP,Alive,Protocol,Services,UserAgent,StartHeight\n");
+	fprintf(peers_csv, "IP,MainnetPortOpen,Protocol,Services,UserAgent,StartHeight\n");
 	walk_peers(peers, print_peer, peers_csv);
 	fclose(peers_csv);
 
