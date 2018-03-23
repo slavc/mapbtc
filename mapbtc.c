@@ -16,23 +16,27 @@
 #include <stdbool.h>
 #include <time.h>
 #include <limits.h>
+#include <search.h>
 
 #include "protocol.h"
 #include "pack.h"
 
-// FIXME Enable IPv6 back
-#define DISABLE_IPV6 true 
-
 #define MAX_WAIT 60 // seconds
 
+struct peer;
+
 uint64_t g_my_nonce;
-uint64_t g_peer_count;
-uint64_t g_visited_count;
 uint64_t g_conn_count;
 uint64_t g_max_conn;
+struct peer *g_connect_queue;
+int g_epoll_fd;
 bool g_quit = false;
+FILE *g_peer_graph_file;
+FILE *g_peer_file;
+void *g_known_ip_addr_tree;
 
 struct peer {
+	struct peer *next;
 	struct addr {
 		int family;
 		union {
@@ -40,9 +44,6 @@ struct peer {
 			struct sockaddr_in6 in6;
 		};
 	} addr;
-	struct peer *left;
-	struct peer *right;
-	int epfd; // epoll fd to which this peer belongs
 	uint32_t epevents; // epoll event mask
 	int conn; // tcp connection socket
 	enum {
@@ -65,7 +66,6 @@ struct peer {
 	// FIXME integrate these bitfields into states?
 	struct version version;
 	unsigned is_dead:1; // we couldn't connect to it
-	unsigned is_visited:1; // we have attempted to connect to it
 };
 
 const char *seeds[] = {
@@ -97,44 +97,6 @@ struct peer *new_peer(int family, const void *addr)
 	return peer;
 }
 
-bool add_peer(struct peer **root, struct peer *peer)
-{
-	if (*root == NULL) {
-		*root = peer;
-		return true;
-	}
-
-	int diff;
-	for (struct peer *cur = *root; cur != NULL; /*empty*/) {
-		diff = cur->addr.family - peer->addr.family;
-		if (diff == 0) {
-			if (cur->addr.family == AF_INET) {
-				diff = memcmp(&cur->addr.in.sin_addr, &peer->addr.in.sin_addr, 4);
-			} else {
-				diff = memcmp(&cur->addr.in6.sin6_addr, &peer->addr.in6.sin6_addr, 16);
-			}
-		}
-		if (diff == 0) { // such peer node already exists
-			break;
-		} else if (diff < 0) {
-			if (cur->left == NULL) {
-				cur->left = peer;
-				return true;
-			} else {
-				cur = cur->left;
-			}
-		} else if (diff > 0) {
-			if (cur->right == NULL) {
-				cur->right = peer;
-				return true;
-			} else {
-				cur = cur->right;
-			}
-		}
-	}
-	return false;
-}
-
 const char *str_peer(struct peer *peer)
 {
 	static char addr[INET6_ADDRSTRLEN];
@@ -151,26 +113,8 @@ const char *str_peer(struct peer *peer)
 	return addr;
 }
 
-bool walk_peers(struct peer *peer, bool (*fn)(void *, struct peer *), void *arg)
+bool print_peer(FILE *f, struct peer *peer)
 {
-	if (peer == NULL) {
-		return true;
-	}
-	if (!walk_peers(peer->left, fn, arg)) {
-		return false;
-	}
-	if (!fn(arg, peer)) {
-		return false;
-	}
-	if (!walk_peers(peer->right, fn, arg)) {
-		return false;
-	}
-	return true;
-}
-
-bool print_peer(void *arg, struct peer *peer)
-{
-	FILE *f = arg;
 	if (f == NULL) {
 		f = stdout;
 	}
@@ -195,6 +139,7 @@ bool connect_to(struct peer *peer)
 
 	if (fcntl(s, F_SETFL, O_NONBLOCK) != 0) {
 		warn("fcntl O_NONBLOCK: %d", errno);
+		close(s);
 		return false;
 	}
 
@@ -216,39 +161,47 @@ bool connect_to(struct peer *peer)
 	return true;
 }
 
-void add_to_poll(struct peer *peer, int epfd)
+void add_to_poll(struct peer *peer)
 {
 	struct epoll_event ev;
 
-	peer->epfd = epfd;
 	peer->epevents = ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
 	ev.data.ptr = peer;
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, peer->conn, &ev) != 0) {
+	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, peer->conn, &ev) != 0) {
 		err(1, "epoll_ctl add");
 	}
 }
 
-bool query_more_peers(void *arg, struct peer *peer)
+struct peer *pop_connect_queue(void)
 {
-	if (peer->is_visited) {
-		return true;
+	struct peer *peer = NULL;
+	if (g_connect_queue != NULL) {
+		peer = g_connect_queue;
+		g_connect_queue = peer->next;
 	}
-	peer->is_visited = true;
-	g_visited_count++;
+	return peer;
+}
 
-	if (!connect_to(peer)) {
-		printf("%s: failed to connect to peer, marking as dead\n", str_peer(peer));
-		peer->is_dead = true;
-		return true;
-	}
+void push_connect_queue(struct peer *peer)
+{
+	peer->next = g_connect_queue;
+	g_connect_queue = peer;
+}
 
-	int epfd = *(int *)arg;
-	add_to_poll(peer, epfd);
-
-	if (++g_conn_count >= g_max_conn) {
-		return false;
-	} else {
-		return true;
+void query_more_peers(void)
+{
+	struct peer *peer;
+	while (g_conn_count < g_max_conn && (peer = pop_connect_queue()) != NULL) {
+		if (!connect_to(peer)) {
+			printf("%s: failed to connect to peer, marking as dead\n", str_peer(peer));
+			peer->is_dead = true;
+			print_peer(g_peer_file, peer);
+			free(peer);
+		} else {
+			printf("Connecting to %s...\n", str_peer(peer));
+			g_conn_count++;
+			add_to_poll(peer);
+		}
 	}
 }
 
@@ -262,7 +215,7 @@ void poll_out(struct peer *peer, bool enable)
 		ev.events = peer->epevents & ~EPOLLOUT;
 	}
 	ev.data.ptr = peer;
-	if (epoll_ctl(peer->epfd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
+	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
 		err(1, "epoll_ctl");
 	}
 }
@@ -277,7 +230,7 @@ void poll_in(struct peer *peer, bool enable)
 		ev.events = peer->epevents & ~EPOLLIN;
 	}
 	ev.data.ptr = peer;
-	if (epoll_ctl(peer->epfd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
+	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
 		err(1, "epoll_ctl");
 	}
 }
@@ -370,7 +323,7 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 
 void disconnect_from(struct peer *peer)
 {
-	if (epoll_ctl(peer->epfd, EPOLL_CTL_DEL, peer->conn, NULL) == -1) {
+	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, peer->conn, NULL) == -1) {
 		err(1, "epoll_ctl del");
 	}
 	(void)close(peer->conn);
@@ -419,11 +372,11 @@ void set_max_conn(void)
 	}
 
 	if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
-		g_max_conn = rlim.rlim_cur - open_count - 2;
+		g_max_conn = rlim.rlim_cur - open_count;
 	} else if ((rc = sysconf(_SC_OPEN_MAX)) > 0) {
-		g_max_conn = rc - open_count - 2;
+		g_max_conn = rc - open_count;
 	} else {
-		g_max_conn = _POSIX_OPEN_MAX - open_count - 2;
+		g_max_conn = _POSIX_OPEN_MAX - open_count;
 	}
 }
 
@@ -431,6 +384,34 @@ void sighandler(int sig)
 {
 	(void)sig;
 	g_quit = true;
+}
+
+int ip_cmp(const void *a, const void *b)
+{
+	return memcmp(a, b, sizeof(struct in6_addr));
+}
+
+bool is_known_peer(struct in6_addr *ip)
+{
+	struct in6_addr *ip_copy = malloc(sizeof(*ip));
+	memcpy(ip_copy, ip, sizeof(*ip));
+
+	struct in6_addr **node = tsearch(ip_copy, &g_known_ip_addr_tree, ip_cmp);
+	if (*node == ip_copy) {
+		return false;
+	} else {
+		// we already have this IP in the tree
+		free(ip_copy);
+		return true;
+	}
+}
+
+void finalize_peer(struct peer *peer)
+{
+	disconnect_from(peer);
+	g_conn_count--;
+	print_peer(g_peer_file, peer);
+	free(peer);
 }
 
 int main(int argc, char **argv)
@@ -442,23 +423,27 @@ int main(int argc, char **argv)
 		err(1, "signal");
 	}
 
-	struct peer *peers = NULL;
-
 	srand(time(NULL));
 	g_my_nonce = ((uint64_t)rand() << 32) | (uint64_t)rand();
 
-	set_max_conn();
 
-	int epfd = epoll_create(1);
-	if (epfd == -1) {
+	g_epoll_fd = epoll_create(1);
+	if (g_epoll_fd == -1) {
 		err(1, "epoll_create");
 	}
 
-	FILE *peers_graph = fopen("peers_graph.csv", "w");
-	if (peers_graph == NULL) {
+	// FIXME use sqlite to record data about peers?
+	g_peer_graph_file = fopen("peer_graph.csv", "w");
+	if (g_peer_graph_file == NULL) {
 		err(1, "failed to open peers log file");
 	}
-	fprintf(peers_graph, "DstNode,SrcNode\n");
+	fprintf(g_peer_graph_file, "DstNode,SrcNode\n");
+
+	g_peer_file = fopen("peers.csv", "w");
+	if (g_peer_file == NULL) {
+		err(1, "failed to open peers csv file");
+	}
+	fprintf(g_peer_file, "IP,MainnetPortOpen,Protocol,Services,UserAgent,StartHeight\n");
 
 	/*
 	 * Query the seed domain names for initial peers.
@@ -476,22 +461,31 @@ int main(int argc, char **argv)
 
 		printf("Adding peers from seed %s...\n", seeds[i]);
 		for (ai = result; ai != NULL; ai = ai->ai_next) {
-			if (DISABLE_IPV6 && ai->ai_family != AF_INET) {
-				continue;
-			}
 			if (ai->ai_protocol != IPPROTO_TCP) {
 				continue;
 			}
 			if (ai->ai_socktype != SOCK_STREAM) {
 				continue;
 			}
-			struct peer *peer = new_peer(ai->ai_family, ai->ai_addr);
-			fprintf(peers_graph, "%s,%s\n", str_peer(peer), seeds[i]);
-			if (!add_peer(&peers, peer)) {
-				// we already have this peer
-				free(peer);
+			struct in6_addr ip6;
+			if (ai->ai_family == AF_INET) {
+				struct sockaddr_in *sin = (void *)ai->ai_addr;
+				// make an IPv4-mapped IPv6-address
+				memset(&ip6, 0, 10);
+				memset((uint8_t *)&ip6 + 10, 0xff, 2);
+				memcpy((uint8_t *)&ip6 + 12, &sin->sin_addr, 4);
+			} else if (ai->ai_family == AF_INET6) {
+				struct sockaddr_in6 *sin6 = (void *)ai->ai_addr;
+				memcpy(&ip6, &sin6->sin6_addr, sizeof(ip6));
 			} else {
-				g_peer_count++;
+				continue;
+			}
+			char addr_str[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6, &ip6, addr_str, sizeof(addr_str));
+			if (!is_known_peer(&ip6)) {
+				struct peer *peer = new_peer(ai->ai_family, ai->ai_addr);
+				fprintf(g_peer_graph_file, "%s,%s\n", str_peer(peer), seeds[i]);
+				push_connect_queue(peer);
 			}
 		}
 
@@ -504,8 +498,10 @@ int main(int argc, char **argv)
 	 * so on.
 	 */
 
-	walk_peers(peers, query_more_peers, &epfd);
-	while (!g_quit) {
+	set_max_conn();
+	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
+		query_more_peers();
+
 		sigset_t sigmask;
 		if (sigemptyset(&sigmask) == -1) {
 			err(1, "sigemptyset");
@@ -516,9 +512,8 @@ int main(int argc, char **argv)
 		if (sigaddset(&sigmask, SIGTERM) == -1) {
 			err(1, "sigaddset");
 		}
-
 		struct epoll_event ev;
-		int n = epoll_pwait(epfd, &ev, 1, MAX_WAIT*1000, &sigmask);
+		int n = epoll_pwait(g_epoll_fd, &ev, 1, MAX_WAIT*1000, &sigmask);
 		if (n < 0) {
 			if (errno == EINTR) {
 				printf("interrupted\n");
@@ -543,19 +538,14 @@ int main(int argc, char **argv)
 			rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
 			if (rc == -1 || optval != 0) {
 				printf("%s: connection failed...\n", str_peer(peer));
-				disconnect_from(peer);
-				peer->is_dead = true;
-				if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-					walk_peers(peers, query_more_peers, &epfd);
-				}
+				finalize_peer(peer);
 				continue;
-			} else {
-				printf("%s: connected to peer\n", str_peer(peer));
 			}
 
 			// we've connected to a peer or can continue sneding a message
 			switch (peer->state) {
 			case CONNECTING:
+				printf("%s: connected to peer\n", str_peer(peer));
 
 				peer->is_dead = false;
 
@@ -601,21 +591,15 @@ int main(int argc, char **argv)
 				struct hdr hdr;
 				if (!parse_hdr(peer->in.buf, peer->in.size, &hdr)) {
 					printf("%s: received message with invalid header, disconnecting...\n", str_peer(peer));
-					disconnect_from(peer);
-					if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-						walk_peers(peers, query_more_peers, &epfd);
-					}
+					finalize_peer(peer);
 				} else {
 					switch (peer->state) {
 					case EXPECTING_VERSION:
 						if (parse_version_msg(peer->in.buf, peer->in.size, &peer->version)) {
 							start_send_verack_msg(peer);
 						} else {
-							printf("%s: received inavalid version message, disconnecting...\n", str_peer(peer));
-							disconnect_from(peer);
-							if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-								walk_peers(peers, query_more_peers, &epfd);
-							}
+							printf("%s: received invalid version message, disconnecting...\n", str_peer(peer));
+							finalize_peer(peer);
 						}
 						break;
 
@@ -631,24 +615,22 @@ int main(int argc, char **argv)
 
 							if (!(rec_off = unpack_cuint(&num_recs, msg, msg_len))) {
 								printf("%s: failed to parse the number of records in addr message, disconnecting...\n", str_peer(peer));
-								disconnect_from(peer);
-								if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-									walk_peers(peers, query_more_peers, &epfd);
-								}
+								finalize_peer(peer);
 								break;
 							}
 
 							if ((uint64_t)num_recs * (uint64_t)ADDR_REC_SIZE + rec_off > msg_len) {
 								printf("%s: invalid number of records in addr message, disconnecting...\n", str_peer(peer));
-								disconnect_from(peer);
-								if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-									walk_peers(peers, query_more_peers, &epfd);
-								}
+								finalize_peer(peer);
 								break;
 							}
 
 							for (uint16_t i = 0; i < num_recs; i++) {
 								size_t off = rec_off + i*ADDR_REC_SIZE + ADDR_IP_OFF;
+								struct in6_addr *ip6 = (void *)(msg + off);
+								if (is_known_peer(ip6)) {
+									continue;
+								}
 								struct sockaddr_in sin;
 								struct sockaddr_in6 sin6;
 								void *addr_ptr;
@@ -658,8 +640,6 @@ int main(int argc, char **argv)
 									sin.sin_family = AF_INET;
 									addr_ptr = &sin;
 									memcpy(&sin.sin_addr, msg + off + 12, 4);
-								} else if (DISABLE_IPV6) {
-									continue;
 								} else {
 									addr_family = AF_INET6;
 									sin6.sin6_family = AF_INET6;
@@ -667,24 +647,15 @@ int main(int argc, char **argv)
 									memcpy(&sin6.sin6_addr, msg + off, 16);
 								}
 								struct peer *peer_rec = new_peer(addr_family, addr_ptr);
-								fprintf(peers_graph, "%s,", str_peer(peer_rec));
-								fprintf(peers_graph, "%s\n", str_peer(peer));
-								if (!add_peer(&peers, peer_rec)) {
-									// we already have this peer
-									free(peer_rec);
-									continue;
-								} else {
-									g_peer_count++;
-									printf("%s: adding new peer ", str_peer(peer));
-									printf("%s...\n", str_peer(peer_rec));
-								}
+								fprintf(g_peer_graph_file, "%s,", str_peer(peer_rec));
+								fprintf(g_peer_graph_file, "%s\n", str_peer(peer));
+								printf("%s: adding new peer ", str_peer(peer));
+								printf("%s...\n", str_peer(peer_rec));
+								push_connect_queue(peer_rec);
 							}
 
-							disconnect_from(peer);
 							printf("%s: done getting peers, disconnecting...\n", str_peer(peer));
-							if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-								walk_peers(peers, query_more_peers, &epfd);
-							}
+							finalize_peer(peer);
 						}
 						break;
 
@@ -695,31 +666,17 @@ int main(int argc, char **argv)
 			} else if (n_recv == 0) {
 				// peer closed connection
 				printf("%s: peer closed connection...\n", str_peer(peer));
-				disconnect_from(peer);
-				if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-					walk_peers(peers, query_more_peers, &epfd);
-				}
+				finalize_peer(peer);
 			}
 		} else if (ev.events & (EPOLLERR | EPOLLRDHUP)) {
 			printf("%s: connection error, disconnecting...\n", str_peer(peer));
-			disconnect_from(peer);
-			if (--g_conn_count < g_max_conn && g_visited_count < g_peer_count) {
-				walk_peers(peers, query_more_peers, &epfd);
-			}
 			peer->is_dead = true;
+			finalize_peer(peer);
 		}
 	}
 
-	fclose(peers_graph);
-
-	// FIXME use sqlite to record data about peers?
-	FILE *peers_csv = fopen("peers.csv", "w");
-	if (peers_csv == NULL) {
-		err(1, "failed to open peers csv file");
-	}
-	fprintf(peers_csv, "IP,MainnetPortOpen,Protocol,Services,UserAgent,StartHeight\n");
-	walk_peers(peers, print_peer, peers_csv);
-	fclose(peers_csv);
+	fclose(g_peer_graph_file);
+	fclose(g_peer_file);
 
 	return 0;
 }
