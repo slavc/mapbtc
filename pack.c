@@ -1,21 +1,23 @@
+/*
+ * Copyright (c) 2018 Sviatoslav Chagaev <sviatoslav.chagaev@gmail.com>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
-
-/*
-void f(void)
-{
-	uint8_t *buf_ptr = buf;
-	size_t buf_rem = buf_len;
-
-	success =
-	    unpack_buf(&local_addr, 16, &buf_ptr, &buf_rem)
-	    && unpack_buf(&remote_addr, 16, &buf_ptr, &buf_rem);
-}
-*/
-
-// FIXME Network byte order in unpack functions
 
 size_t unpack_cuint(uint64_t *p, uint8_t *buf, size_t buf_size)
 {
