@@ -1,3 +1,8 @@
+/*
+ * Maps out the Bitcoin peer-to-peer network, creating a CSV file with
+ * information about discovered nodes as well as a CSV file describing the
+ * graph of how nodes are connected to each other.
+ */
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/types.h>
