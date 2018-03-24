@@ -7,17 +7,25 @@
 #include <string.h>
 #include <time.h>
 
-#include <openssl/sha.h>
-
+#include "sha256.h"
 #include "pack.h"
 #include "protocol.h"
 
 #define PAYLOADLESS_MSG_CKSUM 0xe2e0f65d
 
+void SHA256(const void *data, size_t len, uint8_t *hash)
+{
+	SHA256_CTX ctx;
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, data, len);
+	sha256_final(&ctx, hash);
+}
+
 uint32_t msg_cksum(const uint8_t *buf, size_t size)
 {
-	uint8_t hash1[SHA256_DIGEST_LENGTH];
-	uint8_t hash2[SHA256_DIGEST_LENGTH];
+	uint8_t hash1[32];
+	uint8_t hash2[32];
 
 	SHA256(buf, size, hash1);
 	SHA256(hash1, sizeof(hash1), hash2);
@@ -53,9 +61,6 @@ size_t pack_version_msg(uint8_t *buf, size_t buf_size, const uint64_t *nonce)
 {
 	const struct in6_addr in6_loop = IN6ADDR_LOOPBACK_INIT;
 
-	// FIXME Design better way to pack messages - 
-	// a field might not get written if the buf is too
-	// small.
 	size_t len = 0;
 	len += pack_header(buf + len, buf_size - len, "version");
 	len += pack32(PROTOCOL_VERSION, buf + len, buf_size - len);
@@ -114,7 +119,6 @@ bool parse_hdr(uint8_t *buf, size_t buf_size, struct hdr *hdr)
 		printf("parse_hdr: wrong magic number\n");
 		return false;
 	}
-	// FIXME check if we recognize the command
 	if (hdr->payload_size > (buf_size - HDR_SIZE)) {
 		printf("parse_hdr: payload size greater than buffer size\n");
 		return false;

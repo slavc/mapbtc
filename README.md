@@ -10,11 +10,16 @@ mapbtc is written in C, it uses Linux epoll(2) and non-blocking I/O to
 communicate with peer nodes asynchronosly thus accelerating the mapping process
 compared to going from node to node one-by-one and communicating synchronously.
 
-## Usage
+mapbtc uses a public domain implementation of SHA256 by Brad Conte, taken from
+the repository https://github.com/B-Con/crypto-algorithms
+
+## Building and running mapbtc
+
+mapbtc has no external dependencies beyond standard C library and Linux
+epoll(2).
 
 To build and run mapbtc:
-1. Install build tools and development package for OpenSSL, e.g. on Fedora
-   `sudo dnf install gcc make openssl-devel`.
+1. Install build tools, e.g. on Fedora Linux: `sudo dnf install gcc make`.
 2. Build mapbtc by typing `make` in it's directory.
 3. Run mapbtc with `./mapbtc`, and it will begin mapping out the Bitcoin
    network.
