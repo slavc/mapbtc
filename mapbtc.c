@@ -26,7 +26,7 @@
 #include "protocol.h"
 #include "pack.h"
 
-#define MAX_WAIT 60 // seconds
+#define MAX_WAIT (3*60) // seconds
 
 struct peer;
 
@@ -42,13 +42,7 @@ void *g_known_ip_addr_tree;
 
 struct peer {
 	struct peer *next;
-	struct addr {
-		int family;
-		union {
-			struct sockaddr_in in;
-			struct sockaddr_in6 in6;
-		};
-	} addr;
+	struct in6_addr addr;
 	uint32_t epevents; // epoll event mask
 	int conn; // tcp connection socket
 	enum {
@@ -68,7 +62,6 @@ struct peer {
 		size_t len; // length of message (to be sent or expected)
 		size_t n; // number of bytes transmitted/received
 	} in, out;
-	// FIXME integrate these bitfields into states?
 	struct version version;
 	unsigned is_dead:1; // we couldn't connect to it
 };
@@ -82,40 +75,30 @@ const char *seeds[] = {
 	"seed.btc.petertodd.org",
 };
 
-struct peer *new_peer(int family, const void *addr)
+struct peer *new_peer(int family, const void *sa)
 {
 	struct peer *peer;
 
 	peer = calloc(1, sizeof(*peer));
-	peer->addr.family = family;
 	if (family == AF_INET) {
-		memcpy(&peer->addr.in, addr, sizeof(struct sockaddr_in));
-		peer->addr.in.sin_family = AF_INET;
-		peer->addr.in.sin_port = htons(MAINNET_PORT);
+		memset(&peer->addr, 0, 10);
+		memset((uint8_t *)&peer->addr + 10, 0xff, 2);
+		memcpy((uint8_t *)&peer->addr + 12, &((struct sockaddr_in *)sa)->sin_addr, sizeof(peer->addr));
 	} else {
-		memcpy(&peer->addr.in6, addr, sizeof(struct sockaddr_in6));
-		peer->addr.in6.sin6_family = AF_INET6;
-		peer->addr.in6.sin6_port = htons(MAINNET_PORT);
+		memcpy(&peer->addr, &((struct sockaddr_in6 *)sa)->sin6_addr, sizeof(peer->addr));
 	}
 	peer->conn = -1;
-	peer->is_dead = true; // considered is_dead until we successfully connect to it
+	peer->is_dead = true; // considered dead until we successfully connect to it
 	return peer;
 }
 
 const char *str_peer(struct peer *peer)
 {
-	static char addr[INET6_ADDRSTRLEN];
-	const void *addr_ptr;
-
-	if (peer->addr.family == AF_INET) {
-		addr_ptr = &peer->addr.in.sin_addr;
-	} else {
-		addr_ptr = &peer->addr.in6.sin6_addr;
-	}
-	if (inet_ntop(peer->addr.family, addr_ptr, addr, sizeof(addr)) == NULL) {
+	static char str_addr[INET6_ADDRSTRLEN] = "";
+	if (inet_ntop(AF_INET6, &peer->addr, str_addr, sizeof(str_addr)) == NULL) {
 		warn("inet_ntop");
 	}
-	return addr;
+	return str_addr;
 }
 
 bool print_peer(FILE *f, struct peer *peer)
@@ -130,13 +113,38 @@ bool print_peer(FILE *f, struct peer *peer)
 	return true;
 }
 
+bool is_ipv4_mapped(const void *a)
+{
+	return memcmp(a, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 10) == 0
+	    && memcmp((const uint8_t *)a + 10, "\xff\xff", 2) == 0;
+}
+
 bool connect_to(struct peer *peer)
 {
 	int s;
-	const struct sockaddr *sa;
+	int family;
+	struct sockaddr_in sin;
+	struct sockaddr_in6 sin6;
+	struct sockaddr *sa;
 	socklen_t sa_len;
 
-       	s = socket(peer->addr.family, SOCK_STREAM, 0);
+	if (is_ipv4_mapped(&peer->addr)) {
+		family = AF_INET;
+		sin.sin_family = AF_INET;
+		sin.sin_port = htons(MAINNET_PORT);
+		memcpy(&sin.sin_addr, (uint8_t *)&peer->addr + 12, 4);
+		sa = (void *)&sin;
+		sa_len = sizeof(sin);
+	} else {
+		family = AF_INET6;
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_port = htons(MAINNET_PORT);
+		memcpy(&sin6.sin6_addr, &peer->addr, 16);
+		sa = (void *)&sin6;
+		sa_len = sizeof(sin6);
+	}
+
+	s = socket(family, SOCK_STREAM, 0);
 	if (s == -1) {
 		warn("socket %d", errno);
 		return false;
@@ -146,14 +154,6 @@ bool connect_to(struct peer *peer)
 		warn("fcntl O_NONBLOCK: %d", errno);
 		close(s);
 		return false;
-	}
-
-	if (peer->addr.family == AF_INET) {
-		sa = (const struct sockaddr *)&peer->addr.in;
-		sa_len = sizeof(peer->addr.in);
-	} else {
-		sa = (const struct sockaddr *)&peer->addr.in6;
-		sa_len = sizeof(peer->addr.in6);
 	}
 
 	if (connect(s, sa, sa_len) != 0 && errno != EINPROGRESS) {
@@ -282,7 +282,6 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 		ssize_t n = read(peer->conn, ptr, rem);
 		*out_n = n;
 		if (n < 0) {
-			// FIXME close connection?
 			warn("recv_msg read");
 			return false;
 		} else if ((size_t)n < rem) {
@@ -360,12 +359,6 @@ void start_send_getaddr_msg(struct peer *peer)
 	poll_out(peer, true);
 }
 
-bool is_ipv4_addr(const void *a)
-{
-	return memcmp(a, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 10) == 0
-	    && memcmp((const uint8_t *)a + 10, "\xff\xff", 2) == 0;
-}
-
 void set_max_conn(void)
 {
 	struct rlimit rlim;
@@ -419,25 +412,21 @@ void finalize_peer(struct peer *peer)
 	free(peer);
 }
 
-int main(int argc, char **argv)
+void set_sigmask(sigset_t *sigmask)
 {
-	(void)argc;
-	(void)argv;
-
-	if (signal(SIGINT, sighandler) == SIG_ERR || signal(SIGTERM, sighandler) == SIG_ERR) {
-		err(1, "signal");
+	if (sigemptyset(sigmask) == -1) {
+		err(1, "sigemptyset");
 	}
-
-	srand(time(NULL));
-	g_my_nonce = ((uint64_t)rand() << 32) | (uint64_t)rand();
-
-
-	g_epoll_fd = epoll_create(1);
-	if (g_epoll_fd == -1) {
-		err(1, "epoll_create");
+	if (sigaddset(sigmask, SIGINT) == -1) {
+		err(1, "sigaddset");
 	}
+	if (sigaddset(sigmask, SIGTERM) == -1) {
+		err(1, "sigaddset");
+	}
+}
 
-	// FIXME use sqlite to record data about peers?
+void open_output_files(void)
+{
 	g_peer_graph_file = fopen("peer_graph.csv", "w");
 	if (g_peer_graph_file == NULL) {
 		err(1, "failed to open peers log file");
@@ -449,11 +438,198 @@ int main(int argc, char **argv)
 		err(1, "failed to open peers csv file");
 	}
 	fprintf(g_peer_file, "IP,MainnetPortOpen,Protocol,Services,UserAgent,StartHeight\n");
+}
 
-	/*
-	 * Query the seed domain names for initial peers.
-	 */
+void close_output_files(void)
+{
+	fclose(g_peer_graph_file);
+	fclose(g_peer_file);
+}
 
+void handle_pollout(struct peer *peer)
+{
+	// we've connected to a peer or can continue sneding a message
+	switch (peer->state) {
+	case CONNECTING:
+		printf("%s: connected to peer\n", str_peer(peer));
+
+		peer->is_dead = false;
+
+		peer->in.size = 1024;
+		peer->in.buf = malloc(peer->in.size);
+		peer->in.len = 0;
+		peer->in.n = 0;
+
+		peer->out.size = 512;
+		peer->out.buf = malloc(peer->out.size);
+		peer->out.len = 0;
+		peer->out.n = 0;
+
+		start_send_version_msg(peer);
+
+		break;
+
+	case SENDING_VERSION:
+		if (send_msg(peer)) {
+			peer->state = EXPECTING_VERSION;
+		}
+		break;
+
+	case SENDING_VERACK:
+		if (send_msg(peer)) {
+			// finished sending verack message, now send getaddr
+			start_send_getaddr_msg(peer);
+		}
+		break;
+
+	case SENDING_GETADDR:
+		if (send_msg(peer)) {
+			peer->state = EXPECTING_ADDR;
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+void handle_pollin(struct peer *peer)
+{
+	// we've received a piece of message from one of the peers
+	ssize_t n_recv = 0;
+	bool have_complete_msg = recv_msg(peer, &n_recv);
+
+	if (!have_complete_msg) {
+		if (n_recv == 0) {
+			// peer closed connection
+			printf("%s: peer closed connection...\n", str_peer(peer));
+			finalize_peer(peer);
+		}
+		return;
+	}
+
+	struct hdr hdr;
+	if (!parse_hdr(peer->in.buf, peer->in.size, &hdr)) {
+		printf("%s: received message with invalid header, disconnecting...\n", str_peer(peer));
+		finalize_peer(peer);
+		return;
+	}
+
+	if (peer->state == EXPECTING_VERSION) {
+		if (parse_version_msg(peer->in.buf, peer->in.size, &peer->version)) {
+			start_send_verack_msg(peer);
+		} else {
+			printf("%s: received invalid version message, disconnecting...\n", str_peer(peer));
+			finalize_peer(peer);
+		}
+	} else if (peer->state == EXPECTING_ADDR) {
+		if (!is_addr_msg(&hdr)) {
+			return;
+		}
+
+		uint8_t *msg = peer->in.buf + HDR_SIZE;
+		size_t msg_len = hdr.payload_size;
+
+		uint64_t num_recs;
+		size_t rec_off;
+
+		if (!(rec_off = unpack_cuint(&num_recs, msg, msg_len))) {
+			printf("%s: failed to parse the number of records in addr message, disconnecting...\n", str_peer(peer));
+			finalize_peer(peer);
+			return;
+		}
+
+		if ((uint64_t)num_recs * (uint64_t)ADDR_REC_SIZE + rec_off > msg_len) {
+			printf("%s: invalid number of records in addr message, disconnecting...\n", str_peer(peer));
+			finalize_peer(peer);
+			return;
+		}
+
+		for (uint16_t i = 0; i < num_recs; i++) {
+			size_t off = rec_off + i*ADDR_REC_SIZE + ADDR_IP_OFF;
+			struct in6_addr *addr = (void *)(msg + off);
+			if (is_known_peer(addr)) {
+				continue;
+			}
+			struct sockaddr_in sin;
+			struct sockaddr_in6 sin6;
+			void *addr_ptr;
+			int addr_family;
+			if (is_ipv4_mapped(msg + off)) {
+				addr_family = AF_INET;
+				sin.sin_family = AF_INET;
+				addr_ptr = &sin;
+				memcpy(&sin.sin_addr, msg + off + 12, 4);
+			} else {
+				addr_family = AF_INET6;
+				sin6.sin6_family = AF_INET6;
+				addr_ptr = &sin6;
+				memcpy(&sin6.sin6_addr, msg + off, 16);
+			}
+			struct peer *peer_rec = new_peer(addr_family, addr_ptr);
+			fprintf(g_peer_graph_file, "%s,", str_peer(peer_rec));
+			fprintf(g_peer_graph_file, "%s\n", str_peer(peer));
+			printf("%s: adding new peer ", str_peer(peer));
+			printf("%s...\n", str_peer(peer_rec));
+			push_connect_queue(peer_rec);
+		}
+
+		printf("%s: done getting peers, disconnecting...\n", str_peer(peer));
+		finalize_peer(peer);
+	}
+}
+
+void mainloop(void)
+{
+	struct peer *peer;
+	sigset_t sigmask;
+	int optval;
+	socklen_t optlen;
+
+	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
+		query_more_peers();
+
+		set_sigmask(&sigmask);
+		struct epoll_event ev;
+		int n = epoll_pwait(g_epoll_fd, &ev, 1, MAX_WAIT*1000, &sigmask);
+		if (n < 0) {
+			if (errno == EINTR) {
+				printf("interrupted\n");
+				break;
+			}
+			warnx("epoll_wait");
+			continue;
+		}
+		if (n == 0) {
+			// nothing happened in MAX_WAIT seconds - give up
+			printf("no activity in %d seconds, exiting\n", MAX_WAIT);
+			break;
+		}
+
+		peer = ev.data.ptr;
+
+		optlen = sizeof(optval);
+		int rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
+		if (rc == -1 || optval != 0) {
+			printf("%s: connection failed...\n", str_peer(peer));
+			finalize_peer(peer);
+			continue;
+		}
+
+		if (ev.events & EPOLLOUT) {
+			handle_pollout(peer);
+		} else if (ev.events & EPOLLIN) {
+			handle_pollin(peer);
+		} else if (ev.events & (EPOLLERR | EPOLLRDHUP)) {
+			printf("%s: connection error, disconnecting...\n", str_peer(peer));
+			peer->is_dead = true;
+			finalize_peer(peer);
+		}
+	}
+}
+
+void get_initial_peers(void)
+{
 	for (size_t i = 0; i < NELEMS(seeds); i++) {
 		struct addrinfo *result;
 		struct addrinfo *ai;
@@ -472,22 +648,22 @@ int main(int argc, char **argv)
 			if (ai->ai_socktype != SOCK_STREAM) {
 				continue;
 			}
-			struct in6_addr ip6;
+			struct in6_addr addr;
 			if (ai->ai_family == AF_INET) {
 				struct sockaddr_in *sin = (void *)ai->ai_addr;
 				// make an IPv4-mapped IPv6-address
-				memset(&ip6, 0, 10);
-				memset((uint8_t *)&ip6 + 10, 0xff, 2);
-				memcpy((uint8_t *)&ip6 + 12, &sin->sin_addr, 4);
+				memset(&addr, 0, 10);
+				memset((uint8_t *)&addr + 10, 0xff, 2);
+				memcpy((uint8_t *)&addr + 12, &sin->sin_addr, 4);
 			} else if (ai->ai_family == AF_INET6) {
 				struct sockaddr_in6 *sin6 = (void *)ai->ai_addr;
-				memcpy(&ip6, &sin6->sin6_addr, sizeof(ip6));
+				memcpy(&addr, &sin6->sin6_addr, sizeof(addr));
 			} else {
 				continue;
 			}
 			char addr_str[INET6_ADDRSTRLEN];
-			inet_ntop(AF_INET6, &ip6, addr_str, sizeof(addr_str));
-			if (!is_known_peer(&ip6)) {
+			inet_ntop(AF_INET6, &addr, addr_str, sizeof(addr_str));
+			if (!is_known_peer(&addr)) {
 				struct peer *peer = new_peer(ai->ai_family, ai->ai_addr);
 				fprintf(g_peer_graph_file, "%s,%s\n", str_peer(peer), seeds[i]);
 				push_connect_queue(peer);
@@ -496,192 +672,34 @@ int main(int argc, char **argv)
 
 		freeaddrinfo(result);
 	}
+}
 
-	/*
-	 * Connect to the initial peers we got from seed domain names and query
-	 * them for more peers, and query those peers for even more peers, and
-	 * so on.
-	 */
-
-	set_max_conn();
-	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
-		query_more_peers();
-
-		sigset_t sigmask;
-		if (sigemptyset(&sigmask) == -1) {
-			err(1, "sigemptyset");
-		}
-		if (sigaddset(&sigmask, SIGINT) == -1) {
-			err(1, "sigaddset");
-		}
-		if (sigaddset(&sigmask, SIGTERM) == -1) {
-			err(1, "sigaddset");
-		}
-		struct epoll_event ev;
-		int n = epoll_pwait(g_epoll_fd, &ev, 1, MAX_WAIT*1000, &sigmask);
-		if (n < 0) {
-			if (errno == EINTR) {
-				printf("interrupted\n");
-				break;
-			}
-			warnx("epoll_wait");
-			continue;
-		}
-		if (n == 0) {
-			// nothing happened in MAX_WAIT seconds - give up
-			printf("no activity in %d seconds, exiting\n", MAX_WAIT);
-			break;
-		}
-
-		struct peer *peer = ev.data.ptr;
-		int optval;
-		socklen_t optlen;
-		int rc;
-		ssize_t n_recv;
-		if (ev.events & EPOLLOUT) {
-			optlen = sizeof(optval);
-			rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
-			if (rc == -1 || optval != 0) {
-				printf("%s: connection failed...\n", str_peer(peer));
-				finalize_peer(peer);
-				continue;
-			}
-
-			// we've connected to a peer or can continue sneding a message
-			switch (peer->state) {
-			case CONNECTING:
-				printf("%s: connected to peer\n", str_peer(peer));
-
-				peer->is_dead = false;
-
-				peer->in.size = 1024;
-				peer->in.buf = malloc(peer->in.size);
-				peer->in.len = 0;
-				peer->in.n = 0;
-
-				peer->out.size = 512;
-				peer->out.buf = malloc(peer->out.size);
-				peer->out.len = 0;
-				peer->out.n = 0;
-
-				start_send_version_msg(peer);
-
-				break;
-
-			case SENDING_VERSION:
-				if (send_msg(peer)) {
-					peer->state = EXPECTING_VERSION;
-				}
-				break;
-
-			case SENDING_VERACK:
-				if (send_msg(peer)) {
-					// finished sending verack message, now send getaddr
-					start_send_getaddr_msg(peer);
-				}
-				break;
-
-			case SENDING_GETADDR:
-				if (send_msg(peer)) {
-					peer->state = EXPECTING_ADDR;
-				}
-				break;
-
-			default:
-				break;
-			}
-		} else if (ev.events & EPOLLIN) {
-			// we've received a piece of message from one of the peers
-			if (recv_msg(peer, &n_recv)) {
-				struct hdr hdr;
-				if (!parse_hdr(peer->in.buf, peer->in.size, &hdr)) {
-					printf("%s: received message with invalid header, disconnecting...\n", str_peer(peer));
-					finalize_peer(peer);
-				} else {
-					switch (peer->state) {
-					case EXPECTING_VERSION:
-						if (parse_version_msg(peer->in.buf, peer->in.size, &peer->version)) {
-							start_send_verack_msg(peer);
-						} else {
-							printf("%s: received invalid version message, disconnecting...\n", str_peer(peer));
-							finalize_peer(peer);
-						}
-						break;
-
-					case EXPECTING_ADDR:
-						if (is_addr_msg(&hdr)) {
-							uint8_t *msg = peer->in.buf + HDR_SIZE;
-							size_t msg_len = hdr.payload_size;
-
-							// FIXME parse message into a data structure?
-
-							uint64_t num_recs;
-							size_t rec_off;
-
-							if (!(rec_off = unpack_cuint(&num_recs, msg, msg_len))) {
-								printf("%s: failed to parse the number of records in addr message, disconnecting...\n", str_peer(peer));
-								finalize_peer(peer);
-								break;
-							}
-
-							if ((uint64_t)num_recs * (uint64_t)ADDR_REC_SIZE + rec_off > msg_len) {
-								printf("%s: invalid number of records in addr message, disconnecting...\n", str_peer(peer));
-								finalize_peer(peer);
-								break;
-							}
-
-							for (uint16_t i = 0; i < num_recs; i++) {
-								size_t off = rec_off + i*ADDR_REC_SIZE + ADDR_IP_OFF;
-								struct in6_addr *ip6 = (void *)(msg + off);
-								if (is_known_peer(ip6)) {
-									continue;
-								}
-								struct sockaddr_in sin;
-								struct sockaddr_in6 sin6;
-								void *addr_ptr;
-								int addr_family;
-								if (is_ipv4_addr(msg + off)) {
-									addr_family = AF_INET;
-									sin.sin_family = AF_INET;
-									addr_ptr = &sin;
-									memcpy(&sin.sin_addr, msg + off + 12, 4);
-								} else {
-									addr_family = AF_INET6;
-									sin6.sin6_family = AF_INET6;
-									addr_ptr = &sin6;
-									memcpy(&sin6.sin6_addr, msg + off, 16);
-								}
-								struct peer *peer_rec = new_peer(addr_family, addr_ptr);
-								fprintf(g_peer_graph_file, "%s,", str_peer(peer_rec));
-								fprintf(g_peer_graph_file, "%s\n", str_peer(peer));
-								printf("%s: adding new peer ", str_peer(peer));
-								printf("%s...\n", str_peer(peer_rec));
-								push_connect_queue(peer_rec);
-							}
-
-							printf("%s: done getting peers, disconnecting...\n", str_peer(peer));
-							finalize_peer(peer);
-						}
-						break;
-
-					default:
-						printf("%s: received an unexpected message, ignoring\n", str_peer(peer));
-					}
-				}
-			} else if (n_recv == 0) {
-				// peer closed connection
-				printf("%s: peer closed connection...\n", str_peer(peer));
-				finalize_peer(peer);
-			}
-		} else if (ev.events & (EPOLLERR | EPOLLRDHUP)) {
-			printf("%s: connection error, disconnecting...\n", str_peer(peer));
-			peer->is_dead = true;
-			finalize_peer(peer);
-		}
+void init_program(void)
+{
+	if (signal(SIGINT, sighandler) == SIG_ERR || signal(SIGTERM, sighandler) == SIG_ERR) {
+		err(1, "signal");
 	}
 
-	fclose(g_peer_graph_file);
-	fclose(g_peer_file);
+	srand(time(NULL));
+	g_my_nonce = ((uint64_t)rand() << 32) | (uint64_t)rand();
+
+	g_epoll_fd = epoll_create(1);
+	if (g_epoll_fd == -1) {
+		err(1, "epoll_create");
+	}
+}
+
+int main(int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+
+	init_program();
+	open_output_files();
+	get_initial_peers();
+	set_max_conn();
+	mainloop();
+	close_output_files();
 
 	return 0;
 }

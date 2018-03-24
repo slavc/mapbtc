@@ -45,7 +45,7 @@ inline bool is_addr_msg(const struct hdr *hdr)
 struct version {
 	uint32_t protocol;
 	uint64_t services;
-	char user_agent[64];
+	char user_agent[128];
 	uint32_t start_height;
 };
 #define VERSION_PROTOCOL_SIZE 4
