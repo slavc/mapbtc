@@ -39,7 +39,7 @@
 #include "pack.h"
 
 #define MAX_WAIT 90 // seconds; max peer inactivity before disconnecting from it
-#define MAX_EPOLL_EVENTS 1024 // max num of epoll events to process at once
+#define MAX_EPOLL_EVENTS 2000 // max number of events epoll will report
 #define MAX_CONN_LIMIT 60000 // max concurrent connections if nofiles ulimit is not set
 
 struct peer {
@@ -723,11 +723,13 @@ bool handle_epoll_event(struct epoll_event *ev)
 	}
 
 	if (ev->events & EPOLLOUT) {
+		print_debug("%s: EPOLLOUT event", str_peer(peer));
 		return handle_pollout(peer);
 	} else if (ev->events & EPOLLIN) {
+		print_debug("%s: EPOLLIN event", str_peer(peer));
 		return handle_pollin(peer);
 	} else /*if (ev->events & (EPOLLERR | EPOLLRDHUP))*/ {
-		print_debug("%s: connection error, disconnecting...", str_peer(peer));
+		print_debug("%s: EPOLLERR or EPOLLRDHUP event, disconnecting...", str_peer(peer));
 		peer->is_dead = true;
 		finalize_peer(peer);
 		return false;
@@ -748,7 +750,7 @@ bool is_timed_out(struct peer *peer)
 void mainloop(void)
 {
 	sigset_t sigmask;
-	struct epoll_event events[1024];
+	struct epoll_event events[MAX_EPOLL_EVENTS];
 	int num_events;
 	int timeout;
 	struct peer *peer;
@@ -788,6 +790,7 @@ void mainloop(void)
 			}
 			continue;
 		}
+		print_debug("processing %d events", num_events);
 		for (int i = 0; i < num_events; i++) {
 			if (handle_epoll_event(&events[i])) {
 				// all ok, we'll be continuing talking to this peer,
