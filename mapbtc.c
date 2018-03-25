@@ -38,7 +38,7 @@
 #include "protocol.h"
 #include "pack.h"
 
-#define MAX_WAIT 60 // seconds; max peer inactivity before disconnecting from it
+#define MAX_WAIT 90 // seconds; max peer inactivity before disconnecting from it
 #define MAX_EPOLL_EVENTS 1024 // max num of epoll events to process at once
 #define MAX_CONN_LIMIT 60000 // max concurrent connections if nofiles ulimit is not set
 
@@ -473,7 +473,11 @@ void set_max_conn(void)
 	}
 
 	if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
-		g_max_conn = rlim.rlim_cur - open_count;
+		if (rlim.rlim_cur == RLIM_INFINITY) {
+			g_max_conn = MAX_CONN_LIMIT;
+		} else {
+			g_max_conn = rlim.rlim_cur - open_count;
+		}
 	} else if ((rc = sysconf(_SC_OPEN_MAX)) > 0) {
 		g_max_conn = rc - open_count;
 	} else {
