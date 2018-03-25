@@ -70,6 +70,7 @@ struct peer {
 	unsigned is_dead:1; // we couldn't connect to it
 };
 
+bool g_verbose = false;
 bool g_no_ipv6 = false;
 uint64_t g_my_nonce;
 uint64_t g_conn_count;
@@ -93,6 +94,9 @@ const char *seeds[] = {
 
 void print_debug(const char *fmt, ...)
 {
+	if (!g_verbose) {
+		return;
+	}
 	FILE *f = stdout;
 	va_list ap;
 	fprintf(f, "debug: ");
@@ -850,8 +854,9 @@ void init_program(void)
 void print_usage(void)
 {
 	printf(
-	    "usage: mapbtc [--noipv6]\n"
-	    "  --noipv6   ignore IPv6 peers\n");
+	    "usage: mapbtc [--noipv6] [--verbose]\n"
+	    "  --noipv6   ignore IPv6 peers\n"
+	    "  --verbose  print debug output\n");
 }
 
 void parse_args(int argc, char **argv)
@@ -862,6 +867,8 @@ void parse_args(int argc, char **argv)
 			exit(EXIT_SUCCESS);
 		} else if (strcmp(*argv, "--noipv6") == 0) {
 			g_no_ipv6 = true;
+		} else if (strcmp(*argv, "--verbose") == 0) {
+			g_verbose = true;
 		} else {
 			print_usage();
 			exit(EXIT_FAILURE);
