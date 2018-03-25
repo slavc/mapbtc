@@ -233,18 +233,21 @@ bool connect_to(struct peer *peer)
 
 	s = socket(family, SOCK_STREAM, 0);
 	if (s == -1) {
-		print_warning("socket: errno %d", errno);
+		int errno_copy = errno;
+		print_warning("%s: socket: errno %d", str_peer(peer), errno_copy);
 		return false;
 	}
 
 	if (fcntl(s, F_SETFL, O_NONBLOCK) != 0) {
-		print_warning("fcntl O_NONBLOCK: errno %d", errno);
+		int errno_copy = errno;
+		print_warning("%s: fcntl O_NONBLOCK: errno %d", str_peer(peer), errno_copy);
 		close(s);
 		return false;
 	}
 
 	if (connect(s, sa, sa_len) != 0 && errno != EINPROGRESS) {
-		print_warning("connect: errno %d", errno);
+		int errno_copy = errno;
+		print_warning("%s: connect: errno %d", str_peer(peer), errno_copy);
 		close(s);
 		return false;
 	}
@@ -260,7 +263,8 @@ void add_to_poll(struct peer *peer)
 	peer->epevents = ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
 	ev.data.ptr = peer;
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, peer->conn, &ev) != 0) {
-		print_error("epoll_ctl add: errno %d", errno);
+		int errno_copy = errno;
+		print_error("epoll_ctl add: errno %d", str_peer(peer), errno_copy);
 		exit(EXIT_FAILURE);
 	}
 }
@@ -309,7 +313,8 @@ void poll_out(struct peer *peer, bool enable)
 	}
 	ev.data.ptr = peer;
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
-		print_error("epoll_ctl: errno %d", errno);
+		int errno_copy = errno;
+		print_error("%s: epoll_ctl: errno %d", str_peer(peer), errno_copy);
 		exit(EXIT_FAILURE);
 	}
 }
@@ -325,7 +330,8 @@ void poll_in(struct peer *peer, bool enable)
 	}
 	ev.data.ptr = peer;
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
-		print_error("epoll_ctl: errno %d", errno);
+		int errno_copy = errno;
+		print_error("%s: epoll_ctl: errno %d", str_peer(peer), errno_copy);
 		exit(EXIT_FAILURE);
 	}
 }
@@ -345,7 +351,8 @@ bool send_msg(struct peer *peer)
 	ssize_t n = write(peer->conn, ptr, rem);
 
 	if (n < 0) {
-		print_warning("send_msg write: errno %d", errno);
+		int errno_copy = errno;
+		print_warning("%s: send_msg write: errno %d", str_peer(peer), errno_copy);
 		return false;
 	} else if ((size_t)n == rem) {
 		poll_out(peer, false);
@@ -373,7 +380,8 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 		*out_n = n;
 		if (n < 0) {
 			if (errno != EAGAIN) {
-				print_warning("recv_msg read: errno %d", errno);
+				int errno_copy = errno;
+				print_warning("%s: recv_msg read: errno %d", str_peer(peer), errno_copy);
 			}
 			return false;
 		} else if ((size_t)n < rem) {
@@ -404,7 +412,8 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 	*out_n = n;
 	if (n < 0) {
 		if (errno != EAGAIN) {
-			print_warning("recv_msg read: errno %d", errno);
+			int errno_copy = errno;
+			print_warning("%s: recv_msg read: errno %d", str_peer(peer), errno_copy);
 		}
 		return false;
 	} else {
@@ -422,7 +431,8 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 void disconnect_from(struct peer *peer)
 {
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, peer->conn, NULL) == -1) {
-		print_error("epoll_ctl del: errno %d", errno);
+		int errno_copy = errno;
+		print_error("%s: epoll_ctl del: errno %d", str_peer(peer), errno_copy);
 		exit(EXIT_FAILURE);
 	}
 	(void)close(peer->conn);
@@ -724,7 +734,8 @@ bool is_timed_out(struct peer *peer)
 {
 	struct timespec t;
 	if (clock_gettime(CLOCK_MONOTONIC, &t) == -1) {
-		print_error("clock_gettime: errno %d", errno);
+		int errno_copy = errno;
+		print_error("%s: clock_gettime: errno %d", str_peer(peer), errno_copy);
 		exit(EXIT_FAILURE);
 	}
 	return t.tv_sec >= peer->timeout.tv_sec;
