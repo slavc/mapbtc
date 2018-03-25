@@ -349,8 +349,10 @@ bool send_msg(struct peer *peer)
 	ssize_t n = write(peer->conn, ptr, rem);
 
 	if (n < 0) {
-		int errno_copy = errno;
-		print_warning("%s: send_msg write: errno %d", str_peer(peer), errno_copy);
+		if (errno != EAGAIN) {
+			int errno_copy = errno;
+			print_warning("%s: send_msg write: errno %d", str_peer(peer), errno_copy);
+		}
 		return false;
 	} else if ((size_t)n == rem) {
 		poll_out(peer, false);
