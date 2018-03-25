@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/queue.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -37,25 +38,15 @@
 #include "protocol.h"
 #include "pack.h"
 
-#define MAX_WAIT (3*60) // seconds
+#define MAX_WAIT 60 // seconds; max peer inactivity before disconnecting from it
 #define MAX_EPOLL_EVENTS 1024 // max num of epoll events to process at once
-
-struct peer;
-
-uint64_t g_my_nonce;
-uint64_t g_conn_count;
-uint64_t g_max_conn;
-struct peer *g_connect_queue;
-int g_epoll_fd;
-bool g_quit = false;
-FILE *g_peer_graph_file;
-FILE *g_peer_file;
-void *g_known_ip_addr_tree;
-bool g_no_ipv6 = false;
+#define MAX_CONN_LIMIT 60000 // max concurrent connections if nofiles ulimit is not set
 
 struct peer {
-	struct peer *next;
 	struct in6_addr addr;
+	struct timespec timeout;
+	struct peer *next;
+	TAILQ_ENTRY(peer) conn_list_entry;
 	uint32_t epevents; // epoll event mask
 	int conn; // tcp connection socket
 	enum {
@@ -78,6 +69,18 @@ struct peer {
 	struct version version;
 	unsigned is_dead:1; // we couldn't connect to it
 };
+
+bool g_no_ipv6 = false;
+uint64_t g_my_nonce;
+uint64_t g_conn_count;
+uint64_t g_max_conn;
+struct peer *g_connect_queue;
+int g_epoll_fd;
+bool g_quit = false;
+FILE *g_peer_graph_file;
+FILE *g_peer_file;
+void *g_known_ip_addr_tree;
+TAILQ_HEAD(conn_list, peer) g_connections = TAILQ_HEAD_INITIALIZER(g_connections);
 
 const char *seeds[] = {
 	"seed.bitcoin.sipa.be",
@@ -119,6 +122,33 @@ void print_error(const char *fmt, ...)
 	vfprintf(f, fmt, ap);
 	va_end(ap);
 	fprintf(f, "\033[0m\n");
+}
+
+struct timespec get_time(void)
+{
+	struct timespec t;
+	if (clock_gettime(CLOCK_MONOTONIC, &t) == -1) {
+		print_error("clock_gettime: errno %d", errno);
+		exit(EXIT_FAILURE);
+	}
+	return t;
+}
+
+void update_timeout(struct peer *peer)
+{
+	peer->timeout = get_time();
+	peer->timeout.tv_nsec = 0;
+	peer->timeout.tv_sec += MAX_WAIT;
+}
+
+int get_epoll_timeout(struct peer *peer)
+{
+	struct timespec t = get_time();
+	t.tv_nsec = 0;
+	if (peer->timeout.tv_sec < t.tv_sec) {
+		return 0;
+	}
+	return (int)(peer->timeout.tv_sec - t.tv_sec)*1000;
 }
 
 struct peer *new_peer(int family, const void *sa)
@@ -163,6 +193,13 @@ bool is_ipv4_mapped(const void *a)
 {
 	return memcmp(a, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 10) == 0
 	    && memcmp((const uint8_t *)a + 10, "\xff\xff", 2) == 0;
+}
+
+bool is_peer_on_conn_list(struct peer *peer)
+{
+
+	return peer->conn_list_entry.tqe_prev != NULL
+	    || peer->conn_list_entry.tqe_next != NULL;
 }
 
 bool connect_to(struct peer *peer)
@@ -460,6 +497,9 @@ bool is_known_peer(struct in6_addr *ip)
 
 void finalize_peer(struct peer *peer)
 {
+	if (is_peer_on_conn_list(peer)) {
+		TAILQ_REMOVE(&g_connections, peer, conn_list_entry);
+	}
 	disconnect_from(peer);
 	g_conn_count--;
 	print_peer(g_peer_file, peer);
@@ -507,7 +547,7 @@ void close_output_files(void)
 	fclose(g_peer_file);
 }
 
-void handle_pollout(struct peer *peer)
+bool handle_pollout(struct peer *peer)
 {
 	// we've connected to a peer or can continue sneding a message
 	switch (peer->state) {
@@ -527,7 +567,6 @@ void handle_pollout(struct peer *peer)
 		peer->out.n = 0;
 
 		start_send_version_msg(peer);
-
 		break;
 
 	case SENDING_VERSION:
@@ -552,28 +591,33 @@ void handle_pollout(struct peer *peer)
 	default:
 		break;
 	}
+
+	return true;
 }
 
-void handle_pollin(struct peer *peer)
+bool handle_pollin(struct peer *peer)
 {
 	// we've received a piece of message from one of the peers
 	ssize_t n_recv = 0;
-	bool have_complete_msg = recv_msg(peer, &n_recv);
+	bool have_complete_msg;
+
+	have_complete_msg = recv_msg(peer, &n_recv);
 
 	if (!have_complete_msg) {
 		if (n_recv == 0) {
 			// peer closed connection
 			print_debug("%s: peer closed connection...", str_peer(peer));
 			finalize_peer(peer);
+			return false;
 		}
-		return;
+		return true;
 	}
 
 	struct hdr hdr;
 	if (!parse_hdr(peer->in.buf, peer->in.size, &hdr)) {
 		print_debug("%s: received message with invalid header, disconnecting...", str_peer(peer));
 		finalize_peer(peer);
-		return;
+		return false;
 	}
 
 	if (peer->state == EXPECTING_VERSION) {
@@ -582,10 +626,11 @@ void handle_pollin(struct peer *peer)
 		} else {
 			print_debug("%s: received invalid version message, disconnecting...", str_peer(peer));
 			finalize_peer(peer);
+			return false;
 		}
 	} else if (peer->state == EXPECTING_ADDR) {
 		if (!is_addr_msg(&hdr)) {
-			return;
+			return true;
 		}
 
 		uint8_t *msg = peer->in.buf + HDR_SIZE;
@@ -597,13 +642,13 @@ void handle_pollin(struct peer *peer)
 		if (!(rec_off = unpack_cuint(&num_recs, msg, msg_len))) {
 			print_debug("%s: failed to parse the number of records in addr message, disconnecting...", str_peer(peer));
 			finalize_peer(peer);
-			return;
+			return false;
 		}
 
 		if ((uint64_t)num_recs * (uint64_t)ADDR_REC_SIZE + rec_off > msg_len) {
 			print_debug("%s: invalid number of records in addr message, disconnecting...", str_peer(peer));
 			finalize_peer(peer);
-			return;
+			return false;
 		}
 
 		for (uint16_t i = 0; i < num_recs; i++) {
@@ -639,9 +684,10 @@ void handle_pollin(struct peer *peer)
 		print_debug("%s: done getting peers, disconnecting...", str_peer(peer));
 		finalize_peer(peer);
 	}
+	return false;
 }
 
-void handle_epoll_event(struct epoll_event *ev)
+bool handle_epoll_event(struct epoll_event *ev)
 {
 	struct peer *peer;
 	int rc;
@@ -655,18 +701,29 @@ void handle_epoll_event(struct epoll_event *ev)
 	if (rc == -1 || optval != 0) {
 		print_debug("%s: connection failed, rc=%d, SO_ERROR=%d...", str_peer(peer), rc, optval);
 		finalize_peer(peer);
-		return;
+		return false;
 	}
 
 	if (ev->events & EPOLLOUT) {
-		handle_pollout(peer);
+		return handle_pollout(peer);
 	} else if (ev->events & EPOLLIN) {
-		handle_pollin(peer);
-	} else if (ev->events & (EPOLLERR | EPOLLRDHUP)) {
+		return handle_pollin(peer);
+	} else /*if (ev->events & (EPOLLERR | EPOLLRDHUP))*/ {
 		print_debug("%s: connection error, disconnecting...", str_peer(peer));
 		peer->is_dead = true;
 		finalize_peer(peer);
+		return false;
 	}
+}
+
+bool is_timed_out(struct peer *peer)
+{
+	struct timespec t;
+	if (clock_gettime(CLOCK_MONOTONIC, &t) == -1) {
+		print_error("clock_gettime: errno %d", errno);
+		exit(EXIT_FAILURE);
+	}
+	return t.tv_sec >= peer->timeout.tv_sec;
 }
 
 void mainloop(void)
@@ -674,12 +731,22 @@ void mainloop(void)
 	sigset_t sigmask;
 	struct epoll_event events[1024];
 	int num_events;
+	int timeout;
+	struct peer *peer;
 
 	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
 		query_more_peers();
 
+		if (!TAILQ_EMPTY(&g_connections)) {
+			peer = TAILQ_FIRST(&g_connections);
+			timeout = get_epoll_timeout(peer);
+			print_debug("using epoll timeout %d ms from peer %s", timeout, str_peer(peer));
+		} else {
+			timeout = -1;
+		}
+
 		set_sigmask(&sigmask);
-		num_events = epoll_pwait(g_epoll_fd, events, MAX_EPOLL_EVENTS, MAX_WAIT*1000, &sigmask);
+		num_events = epoll_pwait(g_epoll_fd, events, MAX_EPOLL_EVENTS, timeout, &sigmask);
 		if (num_events < 0) {
 			if (errno == EINTR) {
 				print_debug("interrupted");
@@ -689,12 +756,29 @@ void mainloop(void)
 			continue;
 		}
 		if (num_events == 0) {
-			// nothing happened in MAX_WAIT seconds - give up
-			print_debug("no activity in %d seconds, exiting", MAX_WAIT);
-			break;
+			while (!TAILQ_EMPTY(&g_connections)) {
+				peer = TAILQ_FIRST(&g_connections);
+				if (is_timed_out(peer)) {
+					print_debug("%s: timed out, disconnecting...", str_peer(peer));
+					finalize_peer(peer);
+				} else {
+					break;
+				}
+			}
+			continue;
 		}
 		for (int i = 0; i < num_events; i++) {
-			handle_epoll_event(&events[i]);
+			if (handle_epoll_event(&events[i])) {
+				// all ok, we'll be continuing talking to this peer,
+				// so update it's timeout and reinsert it at the tail of the timeout list
+				peer = events[i].data.ptr;
+				update_timeout(peer);
+				if (is_peer_on_conn_list(peer)) {
+					// this peer is already on the list, need to remove first
+					TAILQ_REMOVE(&g_connections, peer, conn_list_entry);
+				}
+				TAILQ_INSERT_TAIL(&g_connections, peer, conn_list_entry);
+			}
 		}
 	}
 }
