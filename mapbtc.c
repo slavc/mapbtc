@@ -293,7 +293,7 @@ void query_more_peers(void)
 			print_peer(g_peer_file, peer);
 			free(peer);
 		} else {
-			print_debug("connecting to %s...", str_peer(peer));
+			print_debug("trying to connect to %s...", str_peer(peer));
 			g_conn_count++;
 			add_to_poll(peer);
 		}
@@ -754,6 +754,8 @@ void mainloop(void)
 	struct peer *peer;
 
 	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
+		print_debug("%lu connections", (long unsigned)g_conn_count);
+
 		query_more_peers();
 
 		if (!TAILQ_EMPTY(&g_connections)) {
