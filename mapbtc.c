@@ -24,12 +24,12 @@
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <err.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <time.h>
 #include <limits.h>
 #include <search.h>
@@ -50,6 +50,7 @@ bool g_quit = false;
 FILE *g_peer_graph_file;
 FILE *g_peer_file;
 void *g_known_ip_addr_tree;
+bool g_no_ipv6 = false;
 
 struct peer {
 	struct peer *next;
@@ -86,6 +87,39 @@ const char *seeds[] = {
 	"seed.btc.petertodd.org",
 };
 
+void print_debug(const char *fmt, ...)
+{
+	FILE *f = stdout;
+	va_list ap;
+	fprintf(f, "debug: ");
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fprintf(f, "\n");
+}
+
+void print_warning(const char *fmt, ...)
+{
+	FILE *f = stdout;
+	va_list ap;
+	fprintf(f, "\033[1;33mwarning: ");
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fprintf(f, "\033[0m\n");
+}
+
+void print_error(const char *fmt, ...)
+{
+	FILE *f = stdout;
+	va_list ap;
+	fprintf(f, "\033[1;31merror: ");
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fprintf(f, "\033[0m\n");
+}
+
 struct peer *new_peer(int family, const void *sa)
 {
 	struct peer *peer;
@@ -107,7 +141,7 @@ const char *str_peer(struct peer *peer)
 {
 	static char str_addr[INET6_ADDRSTRLEN] = "";
 	if (inet_ntop(AF_INET6, &peer->addr, str_addr, sizeof(str_addr)) == NULL) {
-		warn("inet_ntop");
+		print_warning("inet_ntop: errno %d", errno);
 	}
 	return str_addr;
 }
@@ -157,18 +191,18 @@ bool connect_to(struct peer *peer)
 
 	s = socket(family, SOCK_STREAM, 0);
 	if (s == -1) {
-		warn("socket %d", errno);
+		print_warning("socket: errno %d", errno);
 		return false;
 	}
 
 	if (fcntl(s, F_SETFL, O_NONBLOCK) != 0) {
-		warn("fcntl O_NONBLOCK: %d", errno);
+		print_warning("fcntl O_NONBLOCK: errno %d", errno);
 		close(s);
 		return false;
 	}
 
 	if (connect(s, sa, sa_len) != 0 && errno != EINPROGRESS) {
-		warn("connect %d", errno);
+		print_warning("connect: errno %d", errno);
 		close(s);
 		return false;
 	}
@@ -184,7 +218,8 @@ void add_to_poll(struct peer *peer)
 	peer->epevents = ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
 	ev.data.ptr = peer;
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, peer->conn, &ev) != 0) {
-		err(1, "epoll_ctl add");
+		print_error("epoll_ctl add: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -209,12 +244,12 @@ void query_more_peers(void)
 	struct peer *peer;
 	while (g_conn_count < g_max_conn && (peer = pop_connect_queue()) != NULL) {
 		if (!connect_to(peer)) {
-			printf("%s: failed to connect to peer, marking as dead\n", str_peer(peer));
+			print_debug("%s: failed to connect to peer, marking as dead", str_peer(peer));
 			peer->is_dead = true;
 			print_peer(g_peer_file, peer);
 			free(peer);
 		} else {
-			printf("Connecting to %s...\n", str_peer(peer));
+			print_debug("connecting to %s...", str_peer(peer));
 			g_conn_count++;
 			add_to_poll(peer);
 		}
@@ -232,7 +267,8 @@ void poll_out(struct peer *peer, bool enable)
 	}
 	ev.data.ptr = peer;
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
-		err(1, "epoll_ctl");
+		print_error("epoll_ctl: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -247,7 +283,8 @@ void poll_in(struct peer *peer, bool enable)
 	}
 	ev.data.ptr = peer;
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, peer->conn, &ev) != 0) {
-		err(1, "epoll_ctl");
+		print_error("epoll_ctl: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -266,7 +303,7 @@ bool send_msg(struct peer *peer)
 	ssize_t n = write(peer->conn, ptr, rem);
 
 	if (n < 0) {
-		warn("send_msg write");
+		print_warning("send_msg write: errno %d", errno);
 		return false;
 	} else if ((size_t)n == rem) {
 		poll_out(peer, false);
@@ -293,7 +330,9 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 		ssize_t n = read(peer->conn, ptr, rem);
 		*out_n = n;
 		if (n < 0) {
-			warn("recv_msg read");
+			if (errno != EAGAIN) {
+				print_warning("recv_msg read: errno %d", errno);
+			}
 			return false;
 		} else if ((size_t)n < rem) {
 			peer->in.n += n;
@@ -306,7 +345,7 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 			peer->in.len = i;
 			peer->in.len += HDR_SIZE;
 			if (peer->in.len > MAX_MSG_SIZE) {
-				printf("%s: payload size exceeds maximum, disconnecting...", str_peer(peer));
+				print_debug("%s: payload size exceeds maximum, disconnecting...", str_peer(peer));
 				*out_n = 0;
 				return false;
 			}
@@ -322,7 +361,9 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 	ssize_t n = read(peer->conn, ptr, rem);
 	*out_n = n;
 	if (n < 0) {
-		warn("recv_msg read");
+		if (errno != EAGAIN) {
+			print_warning("recv_msg read: errno %d", errno);
+		}
 		return false;
 	} else {
 		peer->in.n += n;
@@ -339,7 +380,8 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 void disconnect_from(struct peer *peer)
 {
 	if (epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, peer->conn, NULL) == -1) {
-		err(1, "epoll_ctl del");
+		print_error("epoll_ctl del: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 	(void)close(peer->conn);
 	peer->conn = -1;
@@ -426,13 +468,16 @@ void finalize_peer(struct peer *peer)
 void set_sigmask(sigset_t *sigmask)
 {
 	if (sigemptyset(sigmask) == -1) {
-		err(1, "sigemptyset");
+		print_error("sigemptyset: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 	if (sigaddset(sigmask, SIGINT) == -1) {
-		err(1, "sigaddset");
+		print_error("sigaddset: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 	if (sigaddset(sigmask, SIGTERM) == -1) {
-		err(1, "sigaddset");
+		print_error("sigaddset: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -440,13 +485,15 @@ void open_output_files(void)
 {
 	g_peer_graph_file = fopen("peer_graph.csv", "w");
 	if (g_peer_graph_file == NULL) {
-		err(1, "failed to open peers log file");
+		print_error("failed to open peers log file: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 	fprintf(g_peer_graph_file, "DstNode,SrcNode\n");
 
 	g_peer_file = fopen("peers.csv", "w");
 	if (g_peer_file == NULL) {
-		err(1, "failed to open peers csv file");
+		print_error("failed to open peers csv file: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 	fprintf(g_peer_file, "IP,MainnetPortOpen,Protocol,Services,UserAgent,StartHeight\n");
 }
@@ -462,7 +509,7 @@ void handle_pollout(struct peer *peer)
 	// we've connected to a peer or can continue sneding a message
 	switch (peer->state) {
 	case CONNECTING:
-		printf("%s: connected to peer\n", str_peer(peer));
+		print_debug("%s: connected to peer", str_peer(peer));
 
 		peer->is_dead = false;
 
@@ -513,7 +560,7 @@ void handle_pollin(struct peer *peer)
 	if (!have_complete_msg) {
 		if (n_recv == 0) {
 			// peer closed connection
-			printf("%s: peer closed connection...\n", str_peer(peer));
+			print_debug("%s: peer closed connection...", str_peer(peer));
 			finalize_peer(peer);
 		}
 		return;
@@ -521,7 +568,7 @@ void handle_pollin(struct peer *peer)
 
 	struct hdr hdr;
 	if (!parse_hdr(peer->in.buf, peer->in.size, &hdr)) {
-		printf("%s: received message with invalid header, disconnecting...\n", str_peer(peer));
+		print_debug("%s: received message with invalid header, disconnecting...", str_peer(peer));
 		finalize_peer(peer);
 		return;
 	}
@@ -530,7 +577,7 @@ void handle_pollin(struct peer *peer)
 		if (parse_version_msg(peer->in.buf, peer->in.size, &peer->version)) {
 			start_send_verack_msg(peer);
 		} else {
-			printf("%s: received invalid version message, disconnecting...\n", str_peer(peer));
+			print_debug("%s: received invalid version message, disconnecting...", str_peer(peer));
 			finalize_peer(peer);
 		}
 	} else if (peer->state == EXPECTING_ADDR) {
@@ -545,13 +592,13 @@ void handle_pollin(struct peer *peer)
 		size_t rec_off;
 
 		if (!(rec_off = unpack_cuint(&num_recs, msg, msg_len))) {
-			printf("%s: failed to parse the number of records in addr message, disconnecting...\n", str_peer(peer));
+			print_debug("%s: failed to parse the number of records in addr message, disconnecting...", str_peer(peer));
 			finalize_peer(peer);
 			return;
 		}
 
 		if ((uint64_t)num_recs * (uint64_t)ADDR_REC_SIZE + rec_off > msg_len) {
-			printf("%s: invalid number of records in addr message, disconnecting...\n", str_peer(peer));
+			print_debug("%s: invalid number of records in addr message, disconnecting...", str_peer(peer));
 			finalize_peer(peer);
 			return;
 		}
@@ -559,9 +606,6 @@ void handle_pollin(struct peer *peer)
 		for (uint16_t i = 0; i < num_recs; i++) {
 			size_t off = rec_off + i*ADDR_REC_SIZE + ADDR_IP_OFF;
 			struct in6_addr *addr = (void *)(msg + off);
-			if (is_known_peer(addr)) {
-				continue;
-			}
 			struct sockaddr_in sin;
 			struct sockaddr_in6 sin6;
 			void *addr_ptr;
@@ -571,21 +615,25 @@ void handle_pollin(struct peer *peer)
 				sin.sin_family = AF_INET;
 				addr_ptr = &sin;
 				memcpy(&sin.sin_addr, msg + off + 12, 4);
+			} else if (g_no_ipv6) {
+				continue;
 			} else {
 				addr_family = AF_INET6;
 				sin6.sin6_family = AF_INET6;
 				addr_ptr = &sin6;
 				memcpy(&sin6.sin6_addr, msg + off, 16);
 			}
-			struct peer *peer_rec = new_peer(addr_family, addr_ptr);
-			fprintf(g_peer_graph_file, "%s,", str_peer(peer_rec));
-			fprintf(g_peer_graph_file, "%s\n", str_peer(peer));
-			printf("%s: adding new peer ", str_peer(peer));
-			printf("%s...\n", str_peer(peer_rec));
-			push_connect_queue(peer_rec);
+			if (!is_known_peer(addr)) {
+				struct peer *peer_rec = new_peer(addr_family, addr_ptr);
+				fprintf(g_peer_graph_file, "%s,", str_peer(peer_rec));
+				fprintf(g_peer_graph_file, "%s\n", str_peer(peer));
+				print_debug("%s: adding new peer:", str_peer(peer));
+				print_debug("    %s", str_peer(peer_rec));
+				push_connect_queue(peer_rec);
+			}
 		}
 
-		printf("%s: done getting peers, disconnecting...\n", str_peer(peer));
+		print_debug("%s: done getting peers, disconnecting...", str_peer(peer));
 		finalize_peer(peer);
 	}
 }
@@ -605,15 +653,15 @@ void mainloop(void)
 		int n = epoll_pwait(g_epoll_fd, &ev, 1, MAX_WAIT*1000, &sigmask);
 		if (n < 0) {
 			if (errno == EINTR) {
-				printf("interrupted\n");
+				print_debug("interrupted");
 				break;
 			}
-			warnx("epoll_wait");
+			print_warning("epoll_wait: errno %d", errno);
 			continue;
 		}
 		if (n == 0) {
 			// nothing happened in MAX_WAIT seconds - give up
-			printf("no activity in %d seconds, exiting\n", MAX_WAIT);
+			print_debug("no activity in %d seconds, exiting", MAX_WAIT);
 			break;
 		}
 
@@ -622,7 +670,7 @@ void mainloop(void)
 		optlen = sizeof(optval);
 		int rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
 		if (rc == -1 || optval != 0) {
-			printf("%s: connection failed...\n", str_peer(peer));
+			print_debug("%s: connection failed...", str_peer(peer));
 			finalize_peer(peer);
 			continue;
 		}
@@ -632,7 +680,7 @@ void mainloop(void)
 		} else if (ev.events & EPOLLIN) {
 			handle_pollin(peer);
 		} else if (ev.events & (EPOLLERR | EPOLLRDHUP)) {
-			printf("%s: connection error, disconnecting...\n", str_peer(peer));
+			print_debug("%s: connection error, disconnecting...", str_peer(peer));
 			peer->is_dead = true;
 			finalize_peer(peer);
 		}
@@ -647,11 +695,11 @@ void get_initial_peers(void)
 
 		int error = getaddrinfo(seeds[i], NULL, NULL, &result);
 		if (error) {
-			warnx("getaddrinfo %s failed", seeds[i]);
+			print_warning("getaddrinfo %s failed: errno %d", seeds[i], errno);
 			continue;
 		}
 
-		printf("Adding peers from seed %s...\n", seeds[i]);
+		print_debug("adding peers from seed %s...", seeds[i]);
 		for (ai = result; ai != NULL; ai = ai->ai_next) {
 			if (ai->ai_protocol != IPPROTO_TCP) {
 				continue;
@@ -667,13 +715,14 @@ void get_initial_peers(void)
 				memset((uint8_t *)&addr + 10, 0xff, 2);
 				memcpy((uint8_t *)&addr + 12, &sin->sin_addr, 4);
 			} else if (ai->ai_family == AF_INET6) {
+				if (g_no_ipv6) {
+					continue;
+				}
 				struct sockaddr_in6 *sin6 = (void *)ai->ai_addr;
 				memcpy(&addr, &sin6->sin6_addr, sizeof(addr));
 			} else {
 				continue;
 			}
-			char addr_str[INET6_ADDRSTRLEN];
-			inet_ntop(AF_INET6, &addr, addr_str, sizeof(addr_str));
 			if (!is_known_peer(&addr)) {
 				struct peer *peer = new_peer(ai->ai_family, ai->ai_addr);
 				fprintf(g_peer_graph_file, "%s,%s\n", str_peer(peer), seeds[i]);
@@ -688,7 +737,8 @@ void get_initial_peers(void)
 void init_program(void)
 {
 	if (signal(SIGINT, sighandler) == SIG_ERR || signal(SIGTERM, sighandler) == SIG_ERR) {
-		err(1, "signal");
+		print_error("signal: errno %d", errno);
+		exit(EXIT_FAILURE);
 	}
 
 	srand(time(NULL));
@@ -696,15 +746,36 @@ void init_program(void)
 
 	g_epoll_fd = epoll_create(1);
 	if (g_epoll_fd == -1) {
-		err(1, "epoll_create");
+		print_error("epoll_create: errno %d", errno);
+		exit(EXIT_FAILURE);
+	}
+}
+
+void print_usage(void)
+{
+	printf(
+	    "usage: mapbtc [--noipv6]\n"
+	    "  --noipv6   ignore IPv6 peers\n");
+}
+
+void parse_args(int argc, char **argv)
+{
+	while (++argv, --argc) {
+		if (strcmp(*argv, "-h") == 0 || strcmp(*argv, "--help") == 0) {
+			print_usage();
+			exit(EXIT_SUCCESS);
+		} else if (strcmp(*argv, "--noipv6") == 0) {
+			g_no_ipv6 = true;
+		} else {
+			print_usage();
+			exit(EXIT_FAILURE);
+		}
 	}
 }
 
 int main(int argc, char **argv)
 {
-	(void)argc;
-	(void)argv;
-
+	parse_args(argc, argv);
 	init_program();
 	open_output_files();
 	get_initial_peers();
