@@ -462,6 +462,8 @@ void finalize_peer(struct peer *peer)
 	disconnect_from(peer);
 	g_conn_count--;
 	print_peer(g_peer_file, peer);
+	free(peer->in.buf);
+	free(peer->out.buf);
 	free(peer);
 }
 
