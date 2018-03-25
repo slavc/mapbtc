@@ -38,6 +38,7 @@
 #include "pack.h"
 
 #define MAX_WAIT (3*60) // seconds
+#define MAX_EPOLL_EVENTS 1024 // max num of epoll events to process at once
 
 struct peer;
 
@@ -640,21 +641,46 @@ void handle_pollin(struct peer *peer)
 	}
 }
 
-void mainloop(void)
+void handle_epoll_event(struct epoll_event *ev)
 {
 	struct peer *peer;
-	sigset_t sigmask;
+	int rc;
 	int optval;
 	socklen_t optlen;
-	int rc;
+
+	peer = ev->data.ptr;
+
+	optlen = sizeof(optval);
+	rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
+	if (rc == -1 || optval != 0) {
+		print_debug("%s: connection failed, rc=%d, SO_ERROR=%d...", str_peer(peer), rc, optval);
+		finalize_peer(peer);
+		return;
+	}
+
+	if (ev->events & EPOLLOUT) {
+		handle_pollout(peer);
+	} else if (ev->events & EPOLLIN) {
+		handle_pollin(peer);
+	} else if (ev->events & (EPOLLERR | EPOLLRDHUP)) {
+		print_debug("%s: connection error, disconnecting...", str_peer(peer));
+		peer->is_dead = true;
+		finalize_peer(peer);
+	}
+}
+
+void mainloop(void)
+{
+	sigset_t sigmask;
+	struct epoll_event events[1024];
+	int num_events;
 
 	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
 		query_more_peers();
 
 		set_sigmask(&sigmask);
-		struct epoll_event ev;
-		int n = epoll_pwait(g_epoll_fd, &ev, 1, MAX_WAIT*1000, &sigmask);
-		if (n < 0) {
+		num_events = epoll_pwait(g_epoll_fd, events, MAX_EPOLL_EVENTS, MAX_WAIT*1000, &sigmask);
+		if (num_events < 0) {
 			if (errno == EINTR) {
 				print_debug("interrupted");
 				break;
@@ -662,30 +688,13 @@ void mainloop(void)
 			print_warning("epoll_wait: errno %d", errno);
 			continue;
 		}
-		if (n == 0) {
+		if (num_events == 0) {
 			// nothing happened in MAX_WAIT seconds - give up
 			print_debug("no activity in %d seconds, exiting", MAX_WAIT);
 			break;
 		}
-
-		peer = ev.data.ptr;
-
-		optlen = sizeof(optval);
-		rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
-		if (rc == -1 || optval != 0) {
-			print_debug("%s: connection failed, rc=%d, SO_ERROR=%d...", str_peer(peer), rc, optval);
-			finalize_peer(peer);
-			continue;
-		}
-
-		if (ev.events & EPOLLOUT) {
-			handle_pollout(peer);
-		} else if (ev.events & EPOLLIN) {
-			handle_pollin(peer);
-		} else if (ev.events & (EPOLLERR | EPOLLRDHUP)) {
-			print_debug("%s: connection error, disconnecting...", str_peer(peer));
-			peer->is_dead = true;
-			finalize_peer(peer);
+		for (int i = 0; i < num_events; i++) {
+			handle_epoll_event(&events[i]);
 		}
 	}
 }
