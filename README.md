@@ -13,6 +13,23 @@ compared to going from node to node one-by-one and communicating synchronously.
 mapbtc uses a public domain implementation of SHA256 by Brad Conte, taken from
 the repository https://github.com/B-Con/crypto-algorithms
 
+## How it works
+
+mapbtc concurrently connects to the peers it knows, asks them for their lists
+of known peers and as soon as they send the list, connection is closed and
+information about the peer is written to the output file, after which mapbtc
+concurrently connects to the yet-unseen peers from the list the peer returned
+and so on. All the networking I/O is done concurrently using epoll(2) and
+finite state machines.
+
+The initial list of peers is discovered by resolving the hard-coded seed domain
+names.
+
+The maximum number of concurrent connections is determined by the limit of
+maximum number of open file descriptors in the environment, you can view the
+current value of this limit using the `ulimit -n` command. In case this limit
+is set to infinity, the maximum number of connections is capped at 60000.
+
 ## Building and running mapbtc
 
 mapbtc has no external dependencies beyond standard C library and Linux
