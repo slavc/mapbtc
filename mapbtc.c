@@ -646,6 +646,7 @@ void mainloop(void)
 	sigset_t sigmask;
 	int optval;
 	socklen_t optlen;
+	int rc;
 
 	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
 		query_more_peers();
@@ -670,9 +671,9 @@ void mainloop(void)
 		peer = ev.data.ptr;
 
 		optlen = sizeof(optval);
-		int rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
+		rc = getsockopt(peer->conn, SOL_SOCKET, SO_ERROR, &optval, &optlen); 
 		if (rc == -1 || optval != 0) {
-			print_debug("%s: connection failed...", str_peer(peer));
+			print_debug("%s: connection failed, rc=%d, SO_ERROR=%d...", str_peer(peer), rc, optval);
 			finalize_peer(peer);
 			continue;
 		}
