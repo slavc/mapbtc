@@ -80,6 +80,7 @@ int g_epoll_fd;
 bool g_quit = false;
 FILE *g_peer_graph_file;
 FILE *g_peer_file;
+FILE *g_log_stream;
 void *g_known_ip_addr_tree;
 TAILQ_HEAD(conn_list, peer) g_connections = TAILQ_HEAD_INITIALIZER(g_connections);
 
@@ -97,35 +98,32 @@ void print_debug(const char *fmt, ...)
 	if (!g_verbose) {
 		return;
 	}
-	FILE *f = stdout;
 	va_list ap;
-	fprintf(f, "debug: ");
+	fprintf(g_log_stream, "debug: ");
 	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
+	vfprintf(g_log_stream, fmt, ap);
 	va_end(ap);
-	fprintf(f, "\n");
+	fprintf(g_log_stream, "\n");
 }
 
 void print_warning(const char *fmt, ...)
 {
-	FILE *f = stdout;
 	va_list ap;
-	fprintf(f, "\033[1;33mwarning: ");
+	fprintf(g_log_stream, "warning: ");
 	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
+	vfprintf(g_log_stream, fmt, ap);
 	va_end(ap);
-	fprintf(f, "\033[0m\n");
+	fprintf(g_log_stream, "\n");
 }
 
 void print_error(const char *fmt, ...)
 {
-	FILE *f = stdout;
 	va_list ap;
-	fprintf(f, "\033[1;31merror: ");
+	fprintf(g_log_stream, "error: ");
 	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
+	vfprintf(g_log_stream, fmt, ap);
 	va_end(ap);
-	fprintf(f, "\033[0m\n");
+	fprintf(g_log_stream, "\n");
 }
 
 struct timespec get_time(void)
@@ -847,6 +845,8 @@ void get_initial_peers(void)
 
 void init_program(void)
 {
+	g_log_stream = stdout;
+
 	if (signal(SIGINT, sighandler) == SIG_ERR || signal(SIGTERM, sighandler) == SIG_ERR) {
 		print_error("signal: errno %d", errno);
 		exit(EXIT_FAILURE);
