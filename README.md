@@ -50,8 +50,9 @@ You can interrupt mapbtc at any moment using Ctrl+C, it will create the
 had at the moment when it was interrupted.
 
 On a t2.micro Amazon EC2 instance, running Fedora Linux 27 with maximum number
-of file descriptors set to 40000, mapbtc is able to map out the IPv4 nodes
-of Bitcoin peer-to-peer network in about 15 minutes.
+of file descriptors set to 40000, mapbtc is able to map out the IPv4 nodes of
+Bitcoin peer-to-peer network in about 15 minutes, with active (mainnet port
+open) to inactive node ratio being 11000 to 235000.
 
 ## Output files
 
