@@ -184,10 +184,16 @@ bool print_peer(FILE *f, struct peer *peer)
 	if (f == NULL) {
 		f = stdout;
 	}
-	fprintf(f, "%s,%u,%u,%lu,\"%s\",%u\n",
+	fprintf(f, "%s,%u,%u,%lu,\"",
 	    str_peer(peer), (unsigned)!peer->is_dead,
-	    peer->version.protocol, peer->version.services,
-	    peer->version.user_agent, peer->version.start_height);
+	    peer->version.protocol, peer->version.services);
+	for (const char *s = peer->version.user_agent; *s != '\0'; s++) {
+		if (*s == '"') {
+			fputc('\\', f);
+		}
+		fputc(*s, f);
+	}
+	fprintf(f, "\",%u\n", peer->version.start_height);
 	return true;
 }
 
