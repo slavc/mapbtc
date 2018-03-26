@@ -45,8 +45,8 @@
 struct peer {
 	struct in6_addr addr;
 	struct timespec timeout;
-	struct peer *next;
-	TAILQ_ENTRY(peer) conn_list_entry;
+	STAILQ_ENTRY(peer) connect_queue_entry;
+	TAILQ_ENTRY(peer) connections_list_entry;
 	uint32_t epevents; // epoll event mask
 	int conn; // tcp connection socket
 	enum {
@@ -75,14 +75,14 @@ bool g_no_ipv6 = false;
 uint64_t g_my_nonce;
 uint64_t g_conn_count;
 uint64_t g_max_conn;
-struct peer *g_connect_queue;
 int g_epoll_fd;
 bool g_quit = false;
 FILE *g_peer_graph_file;
 FILE *g_peer_file;
 FILE *g_log_stream;
 void *g_known_ip_addr_tree;
-TAILQ_HEAD(conn_list, peer) g_connections = TAILQ_HEAD_INITIALIZER(g_connections);
+STAILQ_HEAD(connect_queue_list, peer) g_connect_queue = STAILQ_HEAD_INITIALIZER(g_connect_queue);
+TAILQ_HEAD(connection_list, peer) g_connections = TAILQ_HEAD_INITIALIZER(g_connections);
 
 const char *seeds[] = {
 	"seed.bitcoin.sipa.be",
@@ -200,8 +200,8 @@ bool is_ipv4_mapped(const void *a)
 bool is_peer_on_conn_list(struct peer *peer)
 {
 
-	return peer->conn_list_entry.tqe_prev != NULL
-	    || peer->conn_list_entry.tqe_next != NULL;
+	return peer->connections_list_entry.tqe_prev != NULL
+	    || peer->connections_list_entry.tqe_next != NULL;
 }
 
 bool connect_to(struct peer *peer)
@@ -267,26 +267,12 @@ void add_to_poll(struct peer *peer)
 	}
 }
 
-struct peer *pop_connect_queue(void)
-{
-	struct peer *peer = NULL;
-	if (g_connect_queue != NULL) {
-		peer = g_connect_queue;
-		g_connect_queue = peer->next;
-	}
-	return peer;
-}
-
-void push_connect_queue(struct peer *peer)
-{
-	peer->next = g_connect_queue;
-	g_connect_queue = peer;
-}
-
 void query_more_peers(void)
 {
 	struct peer *peer;
-	while (g_conn_count < g_max_conn && (peer = pop_connect_queue()) != NULL) {
+	while (g_conn_count < g_max_conn && !STAILQ_EMPTY(&g_connect_queue)) {
+		peer = STAILQ_FIRST(&g_connect_queue);
+		STAILQ_REMOVE_HEAD(&g_connect_queue, connect_queue_entry);
 		if (!connect_to(peer)) {
 			print_debug("%s: failed to connect to peer, marking as dead", str_peer(peer));
 			peer->is_dead = true;
@@ -516,7 +502,7 @@ bool is_known_peer(struct in6_addr *ip)
 void finalize_peer(struct peer *peer)
 {
 	if (is_peer_on_conn_list(peer)) {
-		TAILQ_REMOVE(&g_connections, peer, conn_list_entry);
+		TAILQ_REMOVE(&g_connections, peer, connections_list_entry);
 	}
 	disconnect_from(peer);
 	g_conn_count--;
@@ -695,7 +681,7 @@ bool handle_pollin(struct peer *peer)
 				fprintf(g_peer_graph_file, "%s\n", str_peer(peer));
 				print_debug("%s: adding new peer:", str_peer(peer));
 				print_debug("    %s", str_peer(peer_rec));
-				push_connect_queue(peer_rec);
+				STAILQ_INSERT_TAIL(&g_connect_queue, peer_rec, connect_queue_entry);
 			}
 		}
 
@@ -755,7 +741,7 @@ void mainloop(void)
 	int timeout;
 	struct peer *peer;
 
-	while (!g_quit && (g_conn_count > 0 || g_connect_queue != NULL)) {
+	while (!g_quit && (g_conn_count > 0 || !STAILQ_EMPTY(&g_connect_queue))) {
 		print_debug("%lu connections", (long unsigned)g_conn_count);
 
 		query_more_peers();
@@ -799,9 +785,9 @@ void mainloop(void)
 				update_timeout(peer);
 				if (is_peer_on_conn_list(peer)) {
 					// this peer is already on the list, need to remove first
-					TAILQ_REMOVE(&g_connections, peer, conn_list_entry);
+					TAILQ_REMOVE(&g_connections, peer, connections_list_entry);
 				}
-				TAILQ_INSERT_TAIL(&g_connections, peer, conn_list_entry);
+				TAILQ_INSERT_TAIL(&g_connections, peer, connections_list_entry);
 			}
 		}
 	}
@@ -846,7 +832,7 @@ void get_initial_peers(void)
 			if (!is_known_peer(&addr)) {
 				struct peer *peer = new_peer(ai->ai_family, ai->ai_addr);
 				fprintf(g_peer_graph_file, "%s,%s\n", str_peer(peer), seeds[i]);
-				push_connect_queue(peer);
+				STAILQ_INSERT_TAIL(&g_connect_queue, peer, connect_queue_entry);
 			}
 		}
 
