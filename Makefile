@@ -10,7 +10,7 @@ OBJ = $(SRC:%.c=%.o)
 all: $(PROG)
 
 clean:
-	rm *.o $(PROG)
+	rm -f *.o $(PROG)
 
 $(PROG): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^

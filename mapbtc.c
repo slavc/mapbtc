@@ -361,10 +361,6 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 		return false;
 	}
 
-	if (peer->in.len != 0 && peer->in.n == peer->in.len) {
-		return true;
-	}
-
 	if (peer->in.n < HDR_SIZE) {
 		void *ptr = peer->in.buf + peer->in.n;
 		size_t rem = HDR_SIZE - peer->in.n;
@@ -382,10 +378,12 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 		} else {
 			// finished reading header
 			peer->in.n += n;
-			uint32_t i;
-			unpack32(&i, peer->in.buf + HDR_PAYLOAD_SIZE_OFF, peer->in.n - HDR_PAYLOAD_SIZE_OFF);
-			peer->in.len = i;
-			peer->in.len += HDR_SIZE;
+			struct hdr hdr;
+			if (!peek_hdr(peer->in.buf, peer->in.n, &hdr)) {
+				print_warning("%s: received invalid message header", str_peer(peer));
+				return false;
+			}
+			peer->in.len = HDR_SIZE + hdr.payload_size;
 			if (peer->in.len > MAX_MSG_SIZE) {
 				print_debug("%s: payload size exceeds maximum, disconnecting...", str_peer(peer));
 				*out_n = 0;
@@ -393,6 +391,7 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 			}
 			if (peer->in.len > peer->in.size) {
 				peer->in.size = peer->in.len;
+				// FIXME Check for NULL when calling *alloc
 				peer->in.buf = realloc(peer->in.buf, peer->in.size);
 			}
 		}
@@ -412,7 +411,6 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 		peer->in.n += n;
 		if (peer->in.n == peer->in.len) {
 			peer->in.n = 0;
-			peer->in.len = 0;
 			return true;
 		} else {
 			return false;
@@ -435,7 +433,7 @@ void disconnect_from(struct peer *peer)
 void start_send_version_msg(struct peer *peer)
 {
 	peer->out.n = 0;
-	peer->out.len = pack_version_msg(peer->out.buf, peer->out.size, &g_my_nonce);
+	peer->out.len = pack_version_msg(peer->out.buf, peer->out.size, g_my_nonce);
 	peer->state = SENDING_VERSION;
 }
 
@@ -624,14 +622,14 @@ bool handle_pollin(struct peer *peer)
 	}
 
 	struct hdr hdr;
-	if (!parse_hdr(peer->in.buf, peer->in.size, &hdr)) {
+	if (!unpack_hdr(peer->in.buf, peer->in.len, &hdr)) {
 		print_debug("%s: received message with invalid header, disconnecting...", str_peer(peer));
 		finalize_peer(peer);
 		return false;
 	}
 
 	if (peer->state == EXPECTING_VERSION) {
-		if (parse_version_msg(peer->in.buf, peer->in.size, &peer->version)) {
+		if (unpack_version_msg(peer->in.buf, peer->in.len, &peer->version)) {
 			start_send_verack_msg(peer);
 		} else {
 			print_debug("%s: received invalid version message, disconnecting...", str_peer(peer));
@@ -640,48 +638,37 @@ bool handle_pollin(struct peer *peer)
 		}
 	} else if (peer->state == EXPECTING_ADDR) {
 		if (!is_addr_msg(&hdr)) {
+			print_debug("%s: got %.12s message instead of addr", str_peer(peer), hdr.cmd);
 			return true;
 		}
 
-		uint8_t *msg = peer->in.buf + HDR_SIZE;
-		size_t msg_len = hdr.payload_size;
-
-		uint64_t num_recs;
-		size_t rec_off;
-
-		if (!(rec_off = unpack_cuint(&num_recs, msg, msg_len))) {
-			print_debug("%s: failed to parse the number of records in addr message, disconnecting...", str_peer(peer));
-			finalize_peer(peer);
+		struct addr addr;
+		if (!unpack_addr_msg(peer->in.buf, peer->in.len, &addr)) {
+			print_warning("%s: got bad addr msg", str_peer(peer));
 			return false;
 		}
 
-		if ((uint64_t)num_recs * (uint64_t)ADDR_REC_SIZE + rec_off > msg_len) {
-			print_debug("%s: invalid number of records in addr message, disconnecting...", str_peer(peer));
-			finalize_peer(peer);
-			return false;
-		}
-
-		for (uint16_t i = 0; i < num_recs; i++) {
-			size_t off = rec_off + i*ADDR_REC_SIZE + ADDR_IP_OFF;
-			struct in6_addr *addr = (void *)(msg + off);
+		struct addr_record rec;
+		while (unpack_addr_record(&addr, &rec)) {
 			struct sockaddr_in sin;
 			struct sockaddr_in6 sin6;
 			void *addr_ptr;
 			int addr_family;
-			if (is_ipv4_mapped(msg + off)) {
+			if (is_ipv4_mapped(&rec.ip)) {
 				addr_family = AF_INET;
 				sin.sin_family = AF_INET;
 				addr_ptr = &sin;
-				memcpy(&sin.sin_addr, msg + off + 12, 4);
+				// FIXME Change new_peer() interface so we don't have to do this.
+				memcpy(&sin.sin_addr, (uint8_t *)&rec.ip + 12, 4);
 			} else if (g_no_ipv6) {
 				continue;
 			} else {
 				addr_family = AF_INET6;
 				sin6.sin6_family = AF_INET6;
 				addr_ptr = &sin6;
-				memcpy(&sin6.sin6_addr, msg + off, 16);
+				memcpy(&sin6.sin6_addr, &rec.ip, 16);
 			}
-			if (!is_known_peer(addr)) {
+			if (!is_known_peer(&rec.ip)) {
 				struct peer *peer_rec = new_peer(addr_family, addr_ptr);
 				fprintf(g_peer_graph_file, "%s,", str_peer(peer_rec));
 				fprintf(g_peer_graph_file, "%s\n", str_peer(peer));

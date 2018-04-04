@@ -38,8 +38,12 @@ void SHA256(const void *data, size_t len, uint8_t *hash)
 	sha256_final(&ctx, hash);
 }
 
-uint32_t msg_cksum(const uint8_t *buf, size_t size)
+uint32_t msg_cksum(const void *buf, size_t size)
 {
+	if (size == 0) {
+		return PAYLOADLESS_MSG_CKSUM;
+	}
+
 	uint8_t hash1[32];
 	uint8_t hash2[32];
 
@@ -52,60 +56,65 @@ uint32_t msg_cksum(const uint8_t *buf, size_t size)
 	    | ((uint32_t)hash2[3] << 24);
 }
 
-size_t pack_header(uint8_t *buf, size_t buf_size, const char *cmd)
+size_t pack_header(uint8_t *buf, size_t size, const char *cmd, const void *payload, size_t payload_size)
 {
-	if (buf_size < HDR_SIZE) {
-		return 0;
-	}
+	size_t len;
+	size_t off;
+	uint32_t cksum;
 
-	buf[0] = 0xf9;
-	buf[1] = 0xbe;
-	buf[2] = 0xb4;
-	buf[3] = 0xd9;
+	len = off = 0;
 
-	strcpy((char *)buf + 4, cmd);
+	PACKLE32(HDR_MAGIC);
+	strncpy((char *)buf + 4, cmd, 12);
 	size_t cmd_len = strlen(cmd);
-	memset(buf + 4 + cmd_len, 0, 12 - cmd_len);
-
-	// payload size and checksum fields are filled by
-	// the concrete message pack function
+	if (cmd_len < 12) {
+		memset(buf + 4 + cmd_len, 0, 12 - cmd_len);
+	}
+	len += 12;
+	off += 12;
+	PACKLE32(payload_size);
+	cksum = msg_cksum(payload, payload_size);
+	PACKLE32(cksum);
 
 	return HDR_SIZE;
 }
 
-size_t pack_version_msg(uint8_t *buf, size_t buf_size, const uint64_t *nonce)
+size_t pack_version_msg(uint8_t *buf, size_t size, const uint64_t nonce)
 {
 	const struct in6_addr in6_loop = IN6ADDR_LOOPBACK_INIT;
+	const size_t my_user_agent_len = NELEMS(USER_AGENT) - 1;
+	const time_t now = time(NULL);
 
-	size_t len = 0;
-	len += pack_header(buf + len, buf_size - len, "version");
-	len += pack32(PROTOCOL_VERSION, buf + len, buf_size - len);
-	len += pack64(0, buf + len, buf_size - len);
-	len += pack64(time(NULL), buf + len, buf_size - len);
-	len += pack64(NODE_NETWORK, buf + len, buf_size - len);
-	len += pack_buf(&in6_loop, sizeof(in6_loop), buf + len, buf_size - len);
-	len += pack16(htons(MAINNET_PORT), buf + len, buf_size - len);
-	len += pack64(0, buf + len, buf_size - len);
-	len += pack_buf(&in6_loop, sizeof(in6_loop), buf + len, buf_size - len);
-	len += pack16(htons(MAINNET_PORT), buf + len, buf_size - len);
-	len += pack64(*nonce, buf + len, buf_size - len);
-	len += pack_cuint(NELEMS(USER_AGENT) - 1, buf + len, buf_size - len);
-	len += pack_buf(USER_AGENT, NELEMS(USER_AGENT) - 1, buf + len, buf_size - len);
-	len += pack32(0, buf + len, buf_size - len);
-	len += pack8(0, buf + len, buf_size - len);
+	size_t len;
+	size_t off;
 
-	pack32(len - HDR_SIZE, buf + HDR_PAYLOAD_SIZE_OFF, HDR_PAYLOAD_SIZE_SIZE);
-	pack32(msg_cksum(buf + HDR_SIZE, len - HDR_SIZE), buf + HDR_CKSUM_OFF, HDR_CKSUM_SIZE);
+	len = off = HDR_SIZE;
+
+	PACKLE32(PROTOCOL_VERSION);
+	PACKLE64(0);
+	PACKLE64(now);
+	PACKLE64(NODE_NETWORK);
+	PACKN(&in6_loop, sizeof(in6_loop));
+	PACKBE16(MAINNET_PORT);
+	PACKLE64(0);
+	PACKN(&in6_loop, sizeof(in6_loop));
+	PACKBE16(MAINNET_PORT);
+	PACKLE64(nonce);
+	PACKCINT(my_user_agent_len);
+	PACKN(USER_AGENT, my_user_agent_len);
+	PACKLE32(0);
+	PACK8(0);
+	if (off == len) {
+		(void)pack_header(buf, size, "version",
+		    buf + HDR_SIZE, len - HDR_SIZE);
+	}
 
 	return len;
 }
 
 size_t pack_payloadless_msg(uint8_t *buf, size_t buf_size, const char *cmd)
 {
-	size_t len = pack_header(buf, buf_size, cmd);
-	pack32(0, buf + HDR_PAYLOAD_SIZE_OFF, HDR_PAYLOAD_SIZE_SIZE);
-	pack32(PAYLOADLESS_MSG_CKSUM, buf + HDR_CKSUM_OFF, HDR_CKSUM_SIZE);
-	return len;
+	return pack_header(buf, buf_size, cmd, NULL, 0);
 }
 
 size_t pack_verack_msg(uint8_t *buf, size_t buf_size)
@@ -118,70 +127,114 @@ size_t pack_getaddr_msg(uint8_t *buf, size_t buf_size)
 	return pack_payloadless_msg(buf, buf_size, "getaddr");
 }
 
-bool parse_hdr(uint8_t *buf, size_t buf_size, struct hdr *hdr)
-{
-	if (buf_size < HDR_SIZE) {
-		return false;
-	}
+// FIXME Use proper logging functions throughout the code.
 
-	size_t off = 0;
-	off += unpack32(&hdr->magic, buf, buf_size);
-	memcpy(hdr->cmd, buf + off, HDR_CMD_SIZE);
-	off += HDR_CMD_SIZE;
-	off += unpack32(&hdr->payload_size, buf + off, buf_size - off);
-	off += unpack32(&hdr->cksum, buf + off, buf_size - off);
+bool peek_hdr(uint8_t *buf, size_t size, struct hdr *hdr)
+{
+	UNPACKLE32(hdr->magic);
+	UNPACKN(&hdr->cmd, sizeof(hdr->cmd));
+	UNPACKLE32(hdr->payload_size);
+	UNPACKLE32(hdr->cksum);
 
 	if (hdr->magic != (uint32_t)0xd9b4bef9) {
-		printf("parse_hdr: wrong magic number\n");
-		return false;
-	}
-	if (hdr->payload_size > (buf_size - HDR_SIZE)) {
-		printf("parse_hdr: payload size greater than buffer size\n");
-		return false;
-	}
-	uint32_t cksum;
-	if (hdr->payload_size == 0) {
-		cksum = PAYLOADLESS_MSG_CKSUM;
-	} else {
-		cksum = msg_cksum(buf + HDR_SIZE, hdr->payload_size);
-	}
-	if (hdr->cksum != cksum) {
-		printf("parse_hdr: payload checksum is invalid, %08x but should be %08x\n", hdr->cksum, cksum);
+		printf("unpack_hdr: wrong magic number\n");
 		return false;
 	}
 	return true;
 }
 
-bool parse_version_msg(uint8_t *buf, size_t buf_size, struct version *ver)
+bool unpack_hdr(uint8_t *buf, size_t size, struct hdr *hdr)
 {
-	struct hdr hdr;
-	if (!parse_hdr(buf, buf_size, &hdr)) {
+	UNPACKLE32(hdr->magic);
+	UNPACKN(&hdr->cmd, sizeof(hdr->cmd));
+	UNPACKLE32(hdr->payload_size);
+	UNPACKLE32(hdr->cksum);
+
+	if (hdr->magic != (uint32_t)HDR_MAGIC) {
+		printf("unpack_hdr: wrong magic number\n");
 		return false;
 	}
 
-	uint8_t *msg = buf + HDR_SIZE;
-	size_t msg_len = hdr.payload_size;
-
-	if (msg_len < VERSION_MIN_PAYLOAD_SIZE) {
+	if (hdr->payload_size != size) {
+		printf("unpack_hdr: wrong payload size\n");
 		return false;
 	}
 
-	uint64_t ua_len = 0;
-	size_t ua_off;
-	if (unpack32(&ver->protocol, msg, msg_len)
-	    && unpack64(&ver->services, msg + VERSION_SERVICES_OFF, msg_len - VERSION_SERVICES_OFF)
-	    && VERSION_UA_LEN_OFF < msg_len
-	    && (ua_off = unpack_cuint(&ua_len, msg + VERSION_UA_LEN_OFF, msg_len - VERSION_UA_LEN_OFF))
-	    && (ua_off += VERSION_UA_LEN_OFF)
-	    && (ua_off + ua_len) < msg_len
-	    && unpack32(&ver->start_height, msg + ua_off + ua_len, msg_len - (ua_off + ua_len))) {
-		if (ua_len > sizeof(ver->user_agent)-1) {
-			ua_len = sizeof(ver->user_agent)-1;
-		}
-		memcpy(ver->user_agent, msg + ua_off, ua_len);
-		ver->user_agent[ua_len] = '\0';
-		return true;
+	uint32_t cksum;
+	if (hdr->payload_size == 0) {
+		cksum = PAYLOADLESS_MSG_CKSUM;
 	} else {
+		cksum = msg_cksum(buf, hdr->payload_size);
+	}
+	if (hdr->cksum != cksum) {
+		printf("unpack_hdr: payload checksum is invalid, %08x but should be %08x\n", hdr->cksum, cksum);
 		return false;
 	}
+
+	return true;
 }
+
+bool unpack_version_msg(uint8_t *buf, size_t size, struct version *ver)
+{
+	uint64_t ua_len;
+
+	SKIP(HDR_SIZE);
+
+	UNPACKLE32(ver->protocol);
+	UNPACKLE64(ver->services);
+	SKIP(8); // timestamp
+	SKIP(8); // msg recevier's services
+	SKIP(16); // msg receiver's IPv6 addr
+	SKIP(2); // msg receiver's port
+	SKIP(8); // msg sender's services
+	SKIP(16); // msg sender's IPv6 addr
+	SKIP(2); // msg sender's port
+	SKIP(8); // nonce
+	UNPACKCINT(ua_len); // length of user agent string
+		uint64_t len = ua_len;
+		if (len >= sizeof(ver->user_agent)) {
+			len = sizeof(ver->user_agent) - 1;
+		}
+	UNPACKN(&ver->user_agent, len);
+		ver->user_agent[len] = '\0';
+		SKIP(ua_len - len);
+	UNPACKLE32(ver->start_height);
+	SKIP(sizeof(uint8_t)); // relay flag
+
+	if (size != 0) {
+		return false;
+	}
+
+	return true;
+}
+
+bool unpack_addr_msg(uint8_t *buf, size_t size, struct addr *a)
+{
+	SKIP(HDR_SIZE);
+	UNPACKCINT(a->num);
+	if (size % ADDR_RECORD_SIZE != 0) {
+		return false;
+	}
+	if (a->num != size / ADDR_RECORD_SIZE) {
+		return false;
+	}
+	a->rec_ptr = buf;
+	return true;
+}
+
+bool unpack_addr_record(struct addr *a, struct addr_record *r)
+{
+	if (a->num == 0) {
+		return false;
+	}
+	uint8_t *buf = a->rec_ptr;
+	size_t size = a->num * ADDR_RECORD_SIZE;
+	UNPACKLE32(r->t);
+	UNPACKLE64(r->services);
+	UNPACKN(&r->ip, 16);
+	UNPACKLE16(r->port);
+	a->num--;
+	a->rec_ptr = buf;
+	return true;
+}
+
