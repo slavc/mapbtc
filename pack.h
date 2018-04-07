@@ -195,7 +195,9 @@
 		size -= 9;							\
 		break;								\
 	default:								\
-		out = 0;							\
+		out = buf[0];							\
+		buf += 1;							\
+		size -= 1;							\
 		break;								\
 	}
 
