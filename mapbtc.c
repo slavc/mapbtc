@@ -83,8 +83,7 @@ FILE *g_log_stream;
 void *g_known_ip_addr_tree;
 STAILQ_HEAD(connect_queue_list, peer) g_connect_queue = STAILQ_HEAD_INITIALIZER(g_connect_queue);
 TAILQ_HEAD(connection_list, peer) g_connections = TAILQ_HEAD_INITIALIZER(g_connections);
-
-const char *seeds[] = {
+const char *const g_seeds[] = {
 	"seed.bitcoin.sipa.be",
 	"dnsseed.bluematt.me",
 	"dnsseed.bitcoin.dashjr.org",
@@ -788,17 +787,17 @@ void mainloop(void)
 
 void get_initial_peers(void)
 {
-	for (size_t i = 0; i < NELEMS(seeds); i++) {
+	for (size_t i = 0; i < NELEMS(g_seeds); i++) {
 		struct addrinfo *result;
 		struct addrinfo *ai;
 
-		int error = getaddrinfo(seeds[i], NULL, NULL, &result);
+		int error = getaddrinfo(g_seeds[i], NULL, NULL, &result);
 		if (error) {
-			print_warning("getaddrinfo %s failed: errno %d", seeds[i], errno);
+			print_warning("getaddrinfo %s failed: errno %d", g_seeds[i], errno);
 			continue;
 		}
 
-		print_debug("adding peers from seed %s...", seeds[i]);
+		print_debug("adding peers from seed %s...", g_seeds[i]);
 		for (ai = result; ai != NULL; ai = ai->ai_next) {
 			if (ai->ai_protocol != IPPROTO_TCP) {
 				continue;
@@ -824,7 +823,7 @@ void get_initial_peers(void)
 			}
 			if (!is_known_peer(&addr)) {
 				struct peer *peer = new_peer(ai->ai_family, ai->ai_addr);
-				fprintf(g_peer_graph_file, "%s,%s\n", str_peer(peer), seeds[i]);
+				fprintf(g_peer_graph_file, "%s,%s\n", str_peer(peer), g_seeds[i]);
 				STAILQ_INSERT_TAIL(&g_connect_queue, peer, connect_queue_entry);
 			}
 		}
