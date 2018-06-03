@@ -370,6 +370,7 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 				int errno_copy = errno;
 				print_warning("%s: recv_msg read: errno %d", str_peer(peer), errno_copy);
 			}
+			*out_n = 0; // Signal to caller the connection needs to be closed.
 			return false;
 		} else if ((size_t)n < rem) {
 			peer->in.n += n;
