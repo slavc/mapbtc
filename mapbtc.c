@@ -370,7 +370,6 @@ bool recv_msg(struct peer *peer, ssize_t *out_n)
 				int errno_copy = errno;
 				print_warning("%s: recv_msg read: errno %d", str_peer(peer), errno_copy);
 			}
-			*out_n = 0; // Signal to caller the connection needs to be closed.
 			return false;
 		} else if ((size_t)n < rem) {
 			peer->in.n += n;
@@ -612,9 +611,12 @@ bool handle_pollin(struct peer *peer)
 	have_complete_msg = recv_msg(peer, &n_recv);
 
 	if (!have_complete_msg) {
-		if (n_recv == 0) {
-			// peer closed connection
-			print_debug("%s: peer closed connection...", str_peer(peer));
+		if (n_recv <= 0) {
+			if (n_recv == 0) {
+				print_debug("%s: peer closed connection...", str_peer(peer));
+			} else {
+				print_debug("%s: read error", str_peer(peer));
+			}
 			finalize_peer(peer);
 			return false;
 		}
