@@ -229,25 +229,37 @@ func computeMostAndLeastConnectedPeers(g *PeerGraph) {
 		out uint // number of outgoing edges
 		in uint // number of incoming edges
 	}
-	var least node
-	var most node
+	var least_by_out node
+	var least_by_in node
+	var most_by_out node
+	var most_by_in node
 	var cur node
 
-	least.index = -1
-	most.index = -1
+	least_by_out.index = -1
+	least_by_in.index = -1
+	most_by_out.index = -1
+	most_by_in.index = -1
 
 	for cur.index = 0; cur.index < g.PeerCount(); cur.index++ {
 		cur.out, cur.in = g.GetEdgeCount(cur.index)
-		if least.index == -1 || least.out + least.in > cur.out + cur.in {
-			least = cur
+		if least_by_out.index == -1 || least_by_out.out > cur.out {
+			least_by_out = cur
 		}
-		if most.index == -1 || most.out + most.in < cur.out + cur.in {
-			most = cur
+		if least_by_in.index == -1 || least_by_in.in > cur.in {
+			least_by_in = cur
+		}
+		if most_by_out.index == -1 || most_by_out.out < cur.out {
+			most_by_out = cur
+		}
+		if most_by_in.index == -1 || most_by_in.in < cur.in {
+			most_by_in = cur
 		}
 	}
 
-	fmt.Printf("Most connected peer: %v (%v out, %v in)\n", g.GetPeerName(most.index), most.out, most.in)
-	fmt.Printf("Least connected peer: %v (%v out, %v in)\n", g.GetPeerName(least.index), least.out, least.in)
+	fmt.Printf("Most connected peer by outgoing edges: %v (%v)\n", g.GetPeerName(most_by_out.index), most_by_out.out)
+	fmt.Printf("Most connected peer by incoming edges: %v (%v)\n", g.GetPeerName(most_by_in.index), most_by_in.in)
+	fmt.Printf("Least connected peer by outgoing edges: %v (%v)\n", g.GetPeerName(least_by_out.index), least_by_out.out)
+	fmt.Printf("Least connected peer by incoming edges: %v (%v)\n", g.GetPeerName(least_by_in.index), least_by_in.in)
 }
 
 func main() {
