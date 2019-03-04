@@ -839,7 +839,9 @@ void init_program(void)
 {
 	g_log_stream = stdout;
 
-	if (signal(SIGINT, sighandler) == SIG_ERR || signal(SIGTERM, sighandler) == SIG_ERR) {
+	if (signal(SIGINT, sighandler) == SIG_ERR
+	    || signal(SIGTERM, sighandler) == SIG_ERR
+	    || signal(SIGPIPE, sighandler) == SIG_ERR) {
 		print_error("signal: errno %d", errno);
 		exit(EXIT_FAILURE);
 	}
